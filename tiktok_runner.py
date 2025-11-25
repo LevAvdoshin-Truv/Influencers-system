@@ -23,9 +23,9 @@ def _int_from_config(key, default):
 
 
 # по умолчанию берём N постов на один TikTok-поисковый URL
-DEFAULT_NUM_OF_POSTS = _int_from_config("DEFAULT_NUM_OF_POSTS", 10)
+DEFAULT_NUM_OF_POSTS = _int_from_config("DEFAULT_NUM_OF_POSTS", 3000)
 # базовый максимум постов на кластер (можно переопределить в Settings)
-BASE_MAX_POSTS_PER_CLUSTER = _int_from_config("MAX_POSTS_PER_CLUSTER", 10)
+BASE_MAX_POSTS_PER_CLUSTER = _int_from_config("MAX_POSTS_PER_CLUSTER", 3000)
 
 SPREADSHEET_ID = CONFIG["SPREADSHEET_ID"]
 SERVICE_ACCOUNT_FILE = CONFIG["SERVICE_ACCOUNT_FILE"]
