@@ -13,10 +13,19 @@ with open("config.json", "r", encoding="utf-8") as f:
 BRIGHTDATA_API_KEY = CONFIG["BRIGHTDATA_API_KEY"]
 DATASET_ID = CONFIG["DATASET_ID"]
 
+
+def _int_from_config(key, default):
+    val = CONFIG.get(key, default)
+    try:
+        return int(val)
+    except Exception:
+        return int(default)
+
+
 # по умолчанию берём 10 постов на запрос
-DEFAULT_NUM_OF_POSTS = CONFIG.get("DEFAULT_NUM_OF_POSTS", 10)
-# и дополнительно режем максимум постов на кластер на уровне Python
-MAX_POSTS_PER_CLUSTER = CONFIG.get("MAX_POSTS_PER_CLUSTER", 10)
+DEFAULT_NUM_OF_POSTS = _int_from_config("DEFAULT_NUM_OF_POSTS", 10)
+# базовый максимум постов на кластер (можно переопределить в Settings)
+BASE_MAX_POSTS_PER_CLUSTER = _int_from_config("MAX_POSTS_PER_CLUSTER", 10)
 
 SPREADSHEET_ID = CONFIG["SPREADSHEET_ID"]
 SERVICE_ACCOUNT_FILE = CONFIG["SERVICE_ACCOUNT_FILE"]
@@ -87,7 +96,6 @@ def write_log(service, action, cluster_name, details):
             _last_sleep_log_count = 1
 
         if _last_sleep_log_count > SLEEP_LOG_THROTTLE_LIMIT:
-            # просто выводим в консоль и не пишем в таблицу
             print(
                 f"[LOG THROTTLED] {ts} action={action_text} "
                 f"cluster={cluster_text} details={details_text}"
@@ -349,8 +357,11 @@ def call_gpt_label(prompt_base, text):
     return "N"
 
 
-def apply_gpt_labels(header, rows, target_column, label_column, prompt_base, max_rows=50):
-    """Добавляет Y/N в label_column там, где пусто."""
+def apply_gpt_labels(header, rows, target_column, label_column, prompt_base, max_rows=None):
+    """
+    Добавляет Y/N в label_column там, где пусто.
+    Если max_rows is None — размечаем ВСЕ строки без ограничения.
+    """
     try:
         text_idx = header.index(target_column)
         label_idx = header.index(label_column)
@@ -360,7 +371,7 @@ def apply_gpt_labels(header, rows, target_column, label_column, prompt_base, max
 
     processed = 0
     for r in rows:
-        if processed >= max_rows:
+        if max_rows is not None and processed >= max_rows:
             break
 
         if len(r) < len(header):
@@ -487,6 +498,13 @@ def process_cluster(service, settings, cluster_name, cluster_data):
     # интервал опроса статуса Bright Data (по умолчанию 1 сек)
     status_poll_sec = int(settings.get("status_poll_sec", "1"))
 
+    # лимит постов на кластер: Settings -> max_posts_per_cluster, потом config
+    cluster_limit_raw = settings.get("max_posts_per_cluster", None)
+    try:
+        cluster_limit = int(cluster_limit_raw) if cluster_limit_raw else BASE_MAX_POSTS_PER_CLUSTER
+    except Exception:
+        cluster_limit = BASE_MAX_POSTS_PER_CLUSTER
+
     print("\n================ Новый кластер ================")
     print("Кластер:", cluster_name, "URL-ов:", len(urls))
     write_log(service, "start_cluster", cluster_name, f"urls={len(urls)}")
@@ -523,15 +541,15 @@ def process_cluster(service, settings, cluster_name, cluster_data):
 
             if status == "ready":
                 break
-            if status == "failed":
+            if status in ("failed", "error", "canceled", "canceling"):
                 print(
-                    "Снапшот завершился с ошибкой (failed). Пропускаем кластер."
+                    f"Снапшот завершился с ошибочным статусом ({status}). Пропускаем кластер."
                 )
                 write_log(
                     service,
                     "snapshot_failed",
                     cluster_name,
-                    f"waited={waited}",
+                    f"status={status} waited={waited}",
                 )
                 return
 
@@ -554,12 +572,6 @@ def process_cluster(service, settings, cluster_name, cluster_data):
             max_wait_sec=wait_bright_min * 60,
             poll_sec=poll_sec,
         )
-        write_log(
-            service,
-            "snapshot_downloaded",
-            cluster_name,
-            f"posts={len(posts)}",
-        )
 
     # 2. Если постов нет — выходим без сна
     if not posts:
@@ -567,9 +579,18 @@ def process_cluster(service, settings, cluster_name, cluster_data):
         write_log(service, "no_posts", cluster_name, "0 posts")
         return
 
+    original_posts_len = len(posts)
     # ограничиваем количество постов на кластер
-    if len(posts) > MAX_POSTS_PER_CLUSTER:
-        posts = posts[:MAX_POSTS_PER_CLUSTER]
+    if cluster_limit > 0 and original_posts_len > cluster_limit:
+        posts = posts[:cluster_limit]
+    used_posts_len = len(posts)
+
+    write_log(
+        service,
+        "snapshot_downloaded",
+        cluster_name,
+        f"posts_original={original_posts_len} posts_used={used_posts_len} limit={cluster_limit}",
+    )
 
     # 3. Формируем batch-метку
     batch_label = (
@@ -614,7 +635,7 @@ def process_cluster(service, settings, cluster_name, cluster_data):
         f"old={old_count} new={len(new_rows)} total={len(all_rows)}",
     )
 
-    # 5. Дедуп по url
+    # 5. Глобальный дедуп по url (во всей таблице)
     seen = set()
     deduped = []
     for r in all_rows:
@@ -636,14 +657,14 @@ def process_cluster(service, settings, cluster_name, cluster_data):
         f"before={len(all_rows)} after={len(deduped)}",
     )
 
-    # 6. GPT-разметка
+    # 6. GPT-разметка: размечаем ВСЕ незаполненные строки (без лимита)
     deduped, gpt_count = apply_gpt_labels(
         header,
         deduped,
         gpt_target_column,
         gpt_label_column,
         gpt_prompt,
-        max_rows=50,
+        max_rows=None,
     )
     write_log(service, "gpt_done", cluster_name, f"processed={gpt_count}")
 
