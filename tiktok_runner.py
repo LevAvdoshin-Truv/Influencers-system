@@ -57,11 +57,11 @@ def write_log(service, action, cluster_name, details):
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     row = [[ts, action or "", cluster_name or "", details or ""]]
 
-    # создадим шапку, если лист пустой
+    # создаём шапку, если лист пустой
     try:
         resp = sheet.values().get(
             spreadsheetId=SPREADSHEET_ID,
-            range=f"{SHEET_LOGS}!A1:D1"
+            range=f"{SHEET_LOGS}!A1:D1",
         ).execute()
         values = resp.get("values", [])
         if not values:
@@ -89,11 +89,11 @@ def load_settings(service):
     sheet = service.spreadsheets()
     resp = sheet.values().get(
         spreadsheetId=SPREADSHEET_ID,
-        range=f"{SHEET_SETTINGS}!A:B"
+        range=f"{SHEET_SETTINGS}!A:B",
     ).execute()
     values = resp.get("values", [])
     settings = {}
-    # ожидаем, что первая строка — заголовок (key / value)
+    # пропускаем заголовок
     for row in values[1:]:
         if len(row) >= 2:
             key = (row[0] or "").strip()
@@ -107,7 +107,7 @@ def update_setting(service, key, new_value):
     sheet = service.spreadsheets()
     resp = sheet.values().get(
         spreadsheetId=SPREADSHEET_ID,
-        range=f"{SHEET_SETTINGS}!A:B"
+        range=f"{SHEET_SETTINGS}!A:B",
     ).execute()
     values = resp.get("values", [])
     if not values:
@@ -132,7 +132,7 @@ def update_setting(service, key, new_value):
 
     sheet.values().clear(
         spreadsheetId=SPREADSHEET_ID,
-        range=f"{SHEET_SETTINGS}!A:B"
+        range=f"{SHEET_SETTINGS}!A:B",
     ).execute()
     sheet.values().update(
         spreadsheetId=SPREADSHEET_ID,
@@ -148,14 +148,13 @@ def load_clusters(service):
     sheet = service.spreadsheets()
     resp = sheet.values().get(
         spreadsheetId=SPREADSHEET_ID,
-        range=f"{SHEET_CLUSTERS}!A:D"
+        range=f"{SHEET_CLUSTERS}!A:D",
     ).execute()
     values = resp.get("values", [])
     if len(values) <= 1:
         return {}
 
     rows = values[1:]  # пропускаем заголовок
-
     clusters = {}  # {name: {"order": int, "active": bool, "urls": [...]}}
     for row in rows:
         if len(row) < 4:
@@ -175,6 +174,7 @@ def load_clusters(service):
         if name not in clusters:
             clusters[name] = {"order": order, "active": active_flag, "urls": []}
         clusters[name]["urls"].append(url)
+        # если хоть одна строка активна — считаем кластер активным
         if active_flag:
             clusters[name]["active"] = True
 
@@ -207,7 +207,7 @@ def load_data_sheet(service):
     sheet = service.spreadsheets()
     resp = sheet.values().get(
         spreadsheetId=SPREADSHEET_ID,
-        range=f"{SHEET_DATA}!A1:H"
+        range=f"{SHEET_DATA}!A1:H",
     ).execute()
     values = resp.get("values", [])
     if not values:
@@ -219,6 +219,7 @@ def load_data_sheet(service):
 
 def save_data_sheet(service, header, rows):
     sheet = service.spreadsheets()
+    # выравниваем строки
     norm_rows = []
     for r in rows:
         r = r[:len(header)]
@@ -228,7 +229,7 @@ def save_data_sheet(service, header, rows):
 
     sheet.values().clear(
         spreadsheetId=SPREADSHEET_ID,
-        range=f"{SHEET_DATA}!A1:H"
+        range=f"{SHEET_DATA}!A1:H",
     ).execute()
     sheet.values().update(
         spreadsheetId=SPREADSHEET_ID,
@@ -242,7 +243,7 @@ def ensure_data_header(service):
     sheet = service.spreadsheets()
     resp = sheet.values().get(
         spreadsheetId=SPREADSHEET_ID,
-        range=f"{SHEET_DATA}!A1:H1"
+        range=f"{SHEET_DATA}!A1:H1",
     ).execute()
     values = resp.get("values", [])
     if not values:
@@ -277,10 +278,7 @@ def call_gpt_label(prompt_base, text):
     payload = {
         "model": "gpt-4o-mini",
         "messages": [
-            {
-                "role": "system",
-                "content": "Ты бинарный классификатор. Отвечай только 'Y' или 'N'.",
-            },
+            {"role": "system", "content": "Ты бинарный классификатор. Отвечай только 'Y' или 'N'."},
             {"role": "user", "content": user_content},
         ],
         "max_tokens": 1,
@@ -323,7 +321,7 @@ def call_gpt_label(prompt_base, text):
 
 
 def apply_gpt_labels(header, rows, target_column, label_column, prompt_base, max_rows=50):
-    """Добавляет Y/N в label_column для строк, где ещё нет значения."""
+    """Добавляет Y/N в label_column там, где пусто."""
     try:
         text_idx = header.index(target_column)
         label_idx = header.index(label_column)
@@ -354,7 +352,7 @@ def apply_gpt_labels(header, rows, target_column, label_column, prompt_base, max
 # ---------- Bright Data ----------
 
 def start_scrape_for_urls(urls):
-    """Запускает scrape в Bright Data по списку URLs."""
+    """Запускает scrape в Bright Data по списку URLs (Search URL Fast API)."""
     url = (
         "https://api.brightdata.com/datasets/v3/scrape"
         f"?dataset_id={DATASET_ID}&notify=false&include_errors=true"
@@ -368,16 +366,15 @@ def start_scrape_for_urls(urls):
     print("start_scrape status:", resp.status_code)
 
     if resp.status_code == 200:
+        # сначала пробуем как обычный JSON-массив
         body = resp.text
-
-        # 1) пробуем как обычный JSON-массив
         try:
             data = resp.json()
             if not isinstance(data, list):
                 raise ValueError("not array")
         except Exception:
-            # 2) парсим как NDJSON построчно
-            lines = [l.strip() for l in body.splitlines() if l.strip()]
+            # fallback: NDJSON по строкам
+            lines = [line.strip() for line in body.splitlines() if line.strip()]
             data = []
             bad_count = 0
             for idx, line in enumerate(lines, start=1):
@@ -386,44 +383,58 @@ def start_scrape_for_urls(urls):
                 except json.JSONDecodeError as e:
                     bad_count += 1
                     print(f"NDJSON parse error on line {idx}: {e}")
-                    continue
             print(f"NDJSON parsed: ok={len(data)}, bad={bad_count}")
-
         return {"mode": "sync", "posts": data, "snapshot_id": None}
 
     if resp.status_code == 202:
         j = resp.json()
         sid = j.get("snapshot_id")
         if not sid:
-            raise RuntimeError("202 без snapshot_id")
+            raise RuntimeError("202 без snapshot_id: " + resp.text[:200])
         return {"mode": "async", "posts": None, "snapshot_id": sid}
 
     raise RuntimeError(f"Bright Data error {resp.status_code}: {resp.text[:500]}")
 
 
 def get_snapshot_status(snapshot_id):
+    """Проверка статуса снапшота: running / ready / failed ..."""
     url = f"https://api.brightdata.com/datasets/v3/progress/{snapshot_id}"
     headers = {"Authorization": f"Bearer {BRIGHTDATA_API_KEY}"}
-    resp = requests.get(url, headers=headers, timeout=180)
+    resp = requests.get(url, headers=headers, timeout=60)
     if resp.status_code != 200:
-        raise RuntimeError(
-            f"Status error: {resp.status_code} {resp.text[:200]}"
-        )
+        raise RuntimeError(f"Status error: {resp.status_code} {resp.text[:200]}")
     return resp.json().get("status", "")
 
 
-def download_snapshot(snapshot_id):
+def download_snapshot(snapshot_id, max_wait_sec=600, poll_sec=30):
+    """
+    Качает snapshot. Если Bright Data отвечает 202 (status=building),
+    ждём и повторяем, пока не получим 200 или не упремся в max_wait_sec.
+    """
     url = f"https://api.brightdata.com/datasets/v3/snapshot/{snapshot_id}?format=json"
     headers = {"Authorization": f"Bearer {BRIGHTDATA_API_KEY}"}
-    resp = requests.get(url, headers=headers, timeout=300)
-    if resp.status_code != 200:
-        raise RuntimeError(
-            f"Download error: {resp.status_code} {resp.text[:200]}"
-        )
-    data = resp.json()
-    if not isinstance(data, list):
-        raise RuntimeError("Expected list")
-    return data
+
+    waited = 0
+    while True:
+        resp = requests.get(url, headers=headers, timeout=300)
+
+        if resp.status_code == 200:
+            data = resp.json()
+            if not isinstance(data, list):
+                raise RuntimeError("Expected JSON array from snapshot")
+            return data
+
+        if resp.status_code == 202:
+            # снапшот ещё собирается
+            print(f"Snapshot building (202), waited={waited} sec, msg={resp.text[:200]}")
+            if waited >= max_wait_sec:
+                raise RuntimeError(f"Download timeout after {waited} sec: {resp.text[:200]}")
+            time.sleep(poll_sec)
+            waited += poll_sec
+            continue
+
+        # другая ошибка
+        raise RuntimeError(f"Download error: {resp.status_code} {resp.text[:200]}")
 
 
 # ---------- основной цикл ----------
@@ -443,7 +454,7 @@ def main_loop():
             gpt_label_column = settings.get("gpt_label_column", "gpt_flag")
             gpt_prompt = settings.get(
                 "gpt_prompt",
-                "Считай Y, если текст связан с личными финансами, деньгами или расходами пользователя. Иначе N."
+                "Считай Y, если текст связан с личными финансами, деньгами или расходами пользователя. Иначе N.",
             )
 
             if bot_status != "on":
@@ -464,73 +475,67 @@ def main_loop():
             print("\n================ Новый цикл ================")
             print("Кластер:", cluster_name, "URL-ов:", len(urls))
 
+            # 1. Стартуем сбор
             result = start_scrape_for_urls(urls)
-
             posts = None
 
+            # 2. Sync режим
             if result["mode"] == "sync":
                 posts = result["posts"]
                 write_log(service, "bright_sync_done", cluster_name, f"posts={len(posts)}")
+
+            # 3. Async режим
             else:
                 snapshot_id = result["snapshot_id"]
                 write_log(service, "bright_async_started", cluster_name, f"snapshot_id={snapshot_id}")
                 print("ASYNC, snapshot_id =", snapshot_id)
 
-                # вместо одного большого sleep — опрос статуса каждые poll_sec секунд
                 poll_sec = 60
-                max_wait_sec = wait_bright_min * 60
+                max_progress_wait = wait_bright_min * 60
                 waited = 0
-                posts = None
+                status = "unknown"
 
+                # сначала ждём, пока progress станет ready
                 while True:
                     status = get_snapshot_status(snapshot_id)
                     write_log(service, "snapshot_status", cluster_name, status)
-                    print(f"Статус снапшота: {status}, ждали уже {waited} сек")
+                    print(f"Статус снапшота: {status}, waited={waited} sec")
 
                     if status == "ready":
-                        posts = download_snapshot(snapshot_id)
-                        write_log(
-                            service,
-                            "snapshot_downloaded",
-                            cluster_name,
-                            f"posts={len(posts)} waited={waited}",
-                        )
                         break
-
                     if status == "failed":
-                        print("Снапшот завершился с ошибкой. Пропускаем цикл.")
+                        print("Снапшот завершился с ошибкой (failed). Пропускаем цикл.")
                         write_log(service, "snapshot_failed", cluster_name, f"waited={waited}")
                         break
 
-                    if waited >= max_wait_sec:
-                        print("Превышено максимальное время ожидания снапшота. Пропускаем цикл.")
-                        write_log(service, "snapshot_timeout", cluster_name, f"waited={waited}")
+                    if waited >= max_progress_wait:
+                        print("Таймаут ожидания статуса ready. Пропускаем цикл.")
+                        write_log(service, "snapshot_timeout_status", cluster_name, f"waited={waited}")
                         break
 
                     time.sleep(poll_sec)
                     waited += poll_sec
 
-                if not posts:
-                    print("Не удалось получить посты (async). Спим", sleep_between_min, "минут...")
-                    write_log(
-                        service,
-                        "no_posts_async",
-                        cluster_name,
-                        f"sleep {sleep_between_min} min",
-                    )
+                if status != "ready":
                     time.sleep(sleep_between_min * 60)
                     continue
 
+                # теперь пытаемся скачать снапшот, обрабатывая 202 building
+                posts = download_snapshot(snapshot_id)
+                write_log(service, "snapshot_downloaded", cluster_name, f"posts={len(posts)}")
+
+            # 4. Если постов нет — спим и дальше
             if not posts:
                 print("Постов нет, спим", sleep_between_min, "минут...")
                 write_log(service, "no_posts", cluster_name, f"sleep {sleep_between_min} min")
                 time.sleep(sleep_between_min * 60)
                 continue
 
+            # 5. Формируем batch-метку
             batch_label = datetime.now().strftime("%Y-%m-%d %H:%M") + f" | {COMMAND_NAME} | {cluster_name}"
             print("batch_label:", batch_label)
 
-            # работа с таблицей
+            # 6. Работа с таблицей
             ensure_data_header(service)
             header, old_rows = load_data_sheet(service)
             if not header:
@@ -538,19 +543,18 @@ def main_loop():
 
             old_count = len(old_rows)
 
-            # дописываем новые посты
+            # новые строки
             new_rows = []
             for p in posts:
                 new_rows.append([
                     p.get("url", ""),
                     p.get("play_count") or p.get("playcount") or "",
-                    json.dumps(p.get("hashtags", []), ensure_ascii=False)
-                        if p.get("hashtags") else "",
+                    json.dumps(p.get("hashtags", []), ensure_ascii=False) if p.get("hashtags") else "",
                     p.get("profile_url", ""),
                     p.get("profile_followers", ""),
                     p.get("profile_biography", ""),
                     batch_label,
-                    ""
+                    "",
                 ])
 
             all_rows = old_rows + new_rows
@@ -561,19 +565,19 @@ def main_loop():
                 f"old={old_count} new={len(new_rows)} total={len(all_rows)}",
             )
 
-            # дедуп по url
+            # 7. Дедуп по url
             seen = set()
             deduped = []
             for r in all_rows:
                 if len(r) < len(header):
                     r += [""] * (len(header) - len(r))
-                url = r[0]
-                if not url:
+                url_val = r[0]
+                if not url_val:
                     deduped.append(r)
                     continue
-                if url in seen:
+                if url_val in seen:
                     continue
-                seen.add(url)
+                seen.add(url_val)
                 deduped.append(r)
 
             write_log(
@@ -583,21 +587,22 @@ def main_loop():
                 f"before={len(all_rows)} after={len(deduped)}",
             )
 
-            # GPT-разметка
+            # 8. GPT-разметка
             deduped, gpt_count = apply_gpt_labels(
                 header,
                 deduped,
                 gpt_target_column,
                 gpt_label_column,
                 gpt_prompt,
-                max_rows=50
+                max_rows=50,
             )
             write_log(service, "gpt_done", cluster_name, f"processed={gpt_count}")
 
+            # 9. Сохраняем в Google Sheets
             save_data_sheet(service, header, deduped)
             write_log(service, "cycle_done", cluster_name, f"rows_total={len(deduped)}")
 
-            # запоминаем этот кластер как last_cluster_name
+            # 10. Запоминаем последний кластер
             update_setting(service, "last_cluster_name", cluster_name)
 
             print("Цикл завершён, ждём", sleep_between_min, "минут...")
