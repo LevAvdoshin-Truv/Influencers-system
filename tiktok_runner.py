@@ -22,7 +22,7 @@ def _int_from_config(key, default):
         return int(default)
 
 
-# по умолчанию берём 10 постов на запрос
+# по умолчанию берём N постов на один TikTok-поисковый URL
 DEFAULT_NUM_OF_POSTS = _int_from_config("DEFAULT_NUM_OF_POSTS", 10)
 # базовый максимум постов на кластер (можно переопределить в Settings)
 BASE_MAX_POSTS_PER_CLUSTER = _int_from_config("MAX_POSTS_PER_CLUSTER", 10)
@@ -53,7 +53,7 @@ HEADER = [
     "gpt_flag",
 ]
 
-BOT_VERSION = "2025-11-25_manual_run_v2"
+BOT_VERSION = "2025-11-25_manual_run_v3"
 
 # для анти-дубляжа логов
 _last_log_key = None
@@ -260,6 +260,10 @@ def load_data_sheet(service):
 
 
 def save_data_sheet(service, header, rows):
+    """
+    Сохраняем только A:H. Используем USER_ENTERED,
+    чтобы числа (в т.ч. profile_followers) стали именно числами, а не текстом.
+    """
     sheet = service.spreadsheets()
     # выравниваем строки
     norm_rows = []
@@ -276,7 +280,7 @@ def save_data_sheet(service, header, rows):
     sheet.values().update(
         spreadsheetId=SPREADSHEET_ID,
         range=f"{SHEET_DATA}!A1",
-        valueInputOption="RAW",
+        valueInputOption="USER_ENTERED",  # <-- ключевая правка
         body={"values": [header] + norm_rows},
     ).execute()
 
@@ -597,6 +601,7 @@ def extend_formulas_hij(service, last_row):
     """
     Копирует формулы из H2:J2 на H2:J{last_row}
     (как будто ты протянул формулы вниз).
+    Если в H/I/J формул нет, PASTE_FORMULA ничего не меняет.
     """
     if last_row < 2:
         return
@@ -754,9 +759,12 @@ def process_cluster(service, settings, cluster_name, cluster_data):
     waited = 0
 
     # ждём, пока progress станет ready
+    last_status_logged = None
     while True:
         status = get_snapshot_status(snapshot_id)
-        write_log(service, "snapshot_status", cluster_name, status)
+        if status != last_status_logged:
+            write_log(service, "snapshot_status", cluster_name, status)
+            last_status_logged = status
         print(f"Статус снапшота: {status}, waited={waited} sec")
 
         if status == "ready":
@@ -879,6 +887,18 @@ def process_cluster(service, settings, cluster_name, cluster_data):
         f"before={len(all_rows)} after={len(deduped)}",
     )
 
+    # 5.5. Нормализуем profile_followers (E) во ВСЕХ строках
+    try:
+        followers_idx = header.index("profile_followers")
+    except ValueError:
+        followers_idx = None
+
+    if followers_idx is not None:
+        for r in deduped:
+            if len(r) <= followers_idx:
+                r += [""] * (followers_idx + 1 - len(r))
+            r[followers_idx] = normalize_followers(r[followers_idx])
+
     # 6. GPT-разметка: размечаем ВСЕ незаполненные строки
     deduped, gpt_count = apply_gpt_labels(
         service,
@@ -948,6 +968,10 @@ def run_once():
     # сортируем по order и проходим ВСЕ активные кластеры с 1 до последнего
     active_clusters.sort(key=lambda x: x[1]["order"])
     cluster_names = [name for name, _ in active_clusters]
+
+    print("\nПорядок кластеров в этом запуске:")
+    print(" -> ".join(cluster_names))
+
     write_log(
         service,
         "cluster_sequence",
