@@ -290,83 +290,37 @@ def call_gpt_label(prompt_base, text):
         "temperature": 0,
     }
 
-    resp = requests.post(
-        "https://api.openai.com/v1/chat/completions",
-        headers=headers,
-        json=payload,
-        timeout=60,
-    )
-    if resp.status_code != 200:
-        print("GPT error:", resp.status_code, resp.text[:200])
-        return "N"
-
-    data = resp.json()
-    content = (
-        data.get("choices", [{}])[0]
-        .get("message", {})
-        .get("content", "")
-        .strip()
-        .upper()
-    )
-    if content.startswith("Y"):
-        return "Y"
-    if content.startswith("N"):
-        return "N"
-    return "N"
-
-
-def apply_gpt_labels(header, rows, target_column, label_column, prompt_base, max_rows=50):
-    try:
-        text_idx = header.index(target_column)
-        label_idx = header.index(label_column)
-    except ValueError:
-        print("GPT: не найдена колонка", target_column, "или", label_column)
-        return rows, 0
-
-    processed = 0
-    for r in rows:
-        if processed >= max_rows:
-            break
-        # нормализуем строку
-        if len(r) < len(header):
-            r += [""] * (len(header) - len(r))
-
-        label = (r[label_idx] or "").strip().upper()
-        if label in ("Y", "N"):
-            continue
-
-        text = r[text_idx]
-        yn = call_gpt_label(prompt_base, text)
-        r[label_idx] = yn
-        processed += 1
-
-    return rows, processed
-
-
-# ---------- Bright Data ----------
-
-def start_scrape_for_urls(urls):
-    url = (
-        "https://api.brightdata.com/datasets/v3/scrape"
-        f"?dataset_id={DATASET_ID}&notify=false&include_errors=true"
-    )
-    headers = {"Authorization": f"Bearer {BRIGHTDATA_API_KEY}"}
-
-    inputs = [{"url": u, "num_of_posts": DEFAULT_NUM_OF_POSTS} for u in urls]
-    payload = {"input": inputs}
-
-    resp = requests.post(url, headers=headers, json=payload, timeout=60)
+        # отправляем запрос в Bright Data, даём больше времени на ответ
+    resp = requests.post(url, headers=headers, json=payload, timeout=180)
     print("start_scrape status:", resp.status_code)
 
     if resp.status_code == 200:
+        body = resp.text
+
+        # 1) сначала пробуем как нормальный JSON-массив
         try:
             data = resp.json()
             if not isinstance(data, list):
+                # если это не массив, считаем что формат другой
                 raise ValueError("not array")
         except Exception:
-            lines = [l.strip() for l in resp.text.splitlines() if l.strip()]
-            data = [json.loads(line) for line in lines]
+            # 2) если не получилось — парсим как NDJSON построчно
+            lines = [l.strip() for l in body.splitlines() if l.strip()]
+            data = []
+            bad_count = 0
+            for idx, line in enumerate(lines, start=1):
+                try:
+                    data.append(json.loads(line))
+                except json.JSONDecodeError as e:
+                    bad_count += 1
+                    # не валим весь цикл из-за одной кривой строки
+                    print(f"NDJSON parse error on line {idx}: {e}")
+                    continue
+
+            print(f"NDJSON parsed: ok={len(data)}, bad={bad_count}")
+
         return {"mode": "sync", "posts": data, "snapshot_id": None}
+
 
     if resp.status_code == 202:
         j = resp.json()
