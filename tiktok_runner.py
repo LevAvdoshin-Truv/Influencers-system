@@ -41,7 +41,7 @@ SHEET_CLUSTERS = "Clusters"
 SHEET_DATA = "TikTok_Posts"
 SHEET_LOGS = "Logs"
 
-# заголовки для основного листа
+# заголовки для основного листа (A–H)
 HEADER = [
     "url",
     "play_count",
@@ -53,12 +53,13 @@ HEADER = [
     "gpt_flag",
 ]
 
-# --- ограничение на логирование sleep ---
-SLEEP_LOG_THROTTLE_LIMIT = 3
-_last_sleep_log_key = None
-_last_sleep_log_count = 0
+BOT_VERSION = "2025-11-25_manual_run_v2"
 
-BOT_VERSION = "2025-11-25_01"
+# для анти-дубляжа логов
+_last_log_key = None
+
+# кэш sheetId по названию листа
+_sheet_id_cache = {}
 
 
 # ---------- сервис Google Sheets ----------
@@ -70,15 +71,33 @@ def get_sheets_service():
     return build("sheets", "v4", credentials=creds, cache_discovery=False)
 
 
+def get_sheet_id(service, sheet_title):
+    """Возвращает sheetId по имени листа (кэшируем)."""
+    global _sheet_id_cache
+    if sheet_title in _sheet_id_cache:
+        return _sheet_id_cache[sheet_title]
+
+    spreadsheet = service.spreadsheets().get(
+        spreadsheetId=SPREADSHEET_ID
+    ).execute()
+    for sheet in spreadsheet.get("sheets", []):
+        props = sheet.get("properties", {})
+        if props.get("title") == sheet_title:
+            sheet_id = props.get("sheetId")
+            _sheet_id_cache[sheet_title] = sheet_id
+            return sheet_id
+
+    raise RuntimeError(f"Sheet '{sheet_title}' not found")
+
+
 # ---------- логирование в Logs ----------
 
 def write_log(service, action, cluster_name, details):
     """
     Пишет лог в лист Logs.
-    Если подряд более 3 одинаковых логов с 'sleep' в details
-    для одного action+cluster_name — дальше не логируем.
+    Не дублирует подряд одинаковые action+cluster_name+details.
     """
-    global _last_sleep_log_key, _last_sleep_log_count
+    global _last_log_key
 
     sheet = service.spreadsheets()
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -87,25 +106,11 @@ def write_log(service, action, cluster_name, details):
     cluster_text = cluster_name or ""
     details_text = details or ""
 
-    # троттлинг по sleep
-    is_sleep = isinstance(details_text, str) and "sleep" in details_text.lower()
-    if is_sleep:
-        key = (action_text, cluster_text)
-        if _last_sleep_log_key == key:
-            _last_sleep_log_count += 1
-        else:
-            _last_sleep_log_key = key
-            _last_sleep_log_count = 1
-
-        if _last_sleep_log_count > SLEEP_LOG_THROTTLE_LIMIT:
-            print(
-                f"[LOG THROTTLED] {ts} action={action_text} "
-                f"cluster={cluster_text} details={details_text}"
-            )
-            return
-    else:
-        _last_sleep_log_key = None
-        _last_sleep_log_count = 0
+    key = (action_text, cluster_text, details_text)
+    if _last_log_key == key:
+        # пропускаем точный дубликат
+        return
+    _last_log_key = key
 
     row = [[ts, action_text, cluster_text, details_text]]
 
@@ -160,6 +165,7 @@ def load_settings(service):
 
 
 def update_setting(service, key, new_value):
+    """Оставляем на всякий случай, используем для last_cluster_name."""
     sheet = service.spreadsheets()
     resp = sheet.values().get(
         spreadsheetId=SPREADSHEET_ID,
@@ -293,6 +299,53 @@ def ensure_data_header(service):
     return values[0]
 
 
+# ---------- утилита: нормализация фолловеров (E-колонка) ----------
+
+def normalize_followers(val):
+    """
+    Превращает profile_followers в целое число, если возможно.
+    Понимает строки вида '1,234', '12.3K', '4.5M', '1000'.
+    Если не получилось — возвращает исходное значение.
+    """
+    if val is None:
+        return ""
+
+    if isinstance(val, (int, float)):
+        return int(val)
+
+    s = str(val).strip()
+    if not s:
+        return ""
+
+    # удалим пробелы
+    s = s.replace(" ", "")
+
+    # суффиксы k/m/b
+    lower = s.lower()
+    multiplier = 1
+    if lower.endswith("k"):
+        multiplier = 1_000
+        lower = lower[:-1]
+    elif lower.endswith("m"):
+        multiplier = 1_000_000
+        lower = lower[:-1]
+    elif lower.endswith("b"):
+        multiplier = 1_000_000_000
+        lower = lower[:-1]
+
+    # убираем разделители тысяч
+    cleaned = "".join(ch for ch in lower if ch.isdigit() or ch == ".")
+
+    if not cleaned:
+        return val
+
+    try:
+        num = float(cleaned)
+        return int(round(num * multiplier))
+    except Exception:
+        return val
+
+
 # ---------- GPT ----------
 
 def call_gpt_label(prompt_base, text):
@@ -367,12 +420,11 @@ def apply_gpt_labels(
     target_column,
     label_column,
     prompt_base,
-    max_rows=None,
     log_every=10,
 ):
     """
     Добавляет Y/N в label_column там, где пусто.
-    Если max_rows is None — размечаем ВСЕ строки без ограничения.
+    Размечаем ВСЕ строки без ограничения.
     Логируем прогресс каждые log_every записей.
     """
     try:
@@ -394,9 +446,6 @@ def apply_gpt_labels(
             total_to_process += 1
 
     for r in rows:
-        if max_rows is not None and processed >= max_rows:
-            break
-
         if len(r) < len(header):
             r += [""] * (len(header) - len(r))
 
@@ -542,13 +591,102 @@ def download_snapshot(snapshot_id, max_wait_sec=600, poll_sec=30):
         raise RuntimeError(f"Download error: {resp.status_code} {resp.text[:200]}")
 
 
+# ---------- пост-обработка листа: формулы и формат чисел ----------
+
+def extend_formulas_hij(service, last_row):
+    """
+    Копирует формулы из H2:J2 на H2:J{last_row}
+    (как будто ты протянул формулы вниз).
+    """
+    if last_row < 2:
+        return
+
+    sheet_id = get_sheet_id(service, SHEET_DATA)
+
+    requests_body = {
+        "requests": [
+            {
+                "copyPaste": {
+                    "source": {
+                        "sheetId": sheet_id,
+                        "startRowIndex": 1,   # row 2
+                        "endRowIndex": 2,
+                        "startColumnIndex": 7,  # H
+                        "endColumnIndex": 10,   # J (исключительно)
+                    },
+                    "destination": {
+                        "sheetId": sheet_id,
+                        "startRowIndex": 1,   # row 2
+                        "endRowIndex": last_row,  # до последней строки
+                        "startColumnIndex": 7,
+                        "endColumnIndex": 10,
+                    },
+                    "pasteType": "PASTE_FORMULA",
+                    "pasteOrientation": "NORMAL",
+                }
+            }
+        ]
+    }
+
+    try:
+        service.spreadsheets().batchUpdate(
+            spreadsheetId=SPREADSHEET_ID,
+            body=requests_body,
+        ).execute()
+    except Exception as e:
+        print("extend_formulas_hij error:", repr(e))
+
+
+def format_column_e_numbers(service, last_row):
+    """
+    Ставит формат чисел без десятичных в колонке E (profile_followers)
+    для строк 2..last_row.
+    """
+    if last_row < 2:
+        return
+
+    sheet_id = get_sheet_id(service, SHEET_DATA)
+
+    requests_body = {
+        "requests": [
+            {
+                "repeatCell": {
+                    "range": {
+                        "sheetId": sheet_id,
+                        "startRowIndex": 1,      # row 2
+                        "endRowIndex": last_row,
+                        "startColumnIndex": 4,   # E
+                        "endColumnIndex": 5,
+                    },
+                    "cell": {
+                        "userEnteredFormat": {
+                            "numberFormat": {
+                                "type": "NUMBER",
+                                "pattern": "0",
+                            }
+                        }
+                    },
+                    "fields": "userEnteredFormat.numberFormat",
+                }
+            }
+        ]
+    }
+
+    try:
+        service.spreadsheets().batchUpdate(
+            spreadsheetId=SPREADSHEET_ID,
+            body=requests_body,
+        ).execute()
+    except Exception as e:
+        print("format_column_e_numbers error:", repr(e))
+
+
 # ---------- обработка одного кластера ----------
 
 def process_cluster(service, settings, cluster_name, cluster_data):
     """
     Полный цикл по одному кластеру:
     Bright Data -> запись в таблицу -> дедуп -> GPT-разметка.
-    Никаких больших sleep между кластерами.
     """
     urls = cluster_data["urls"]
     wait_bright_min = int(settings.get("wait_bright_min", "20"))
@@ -602,66 +740,60 @@ def process_cluster(service, settings, cluster_name, cluster_data):
     )
     posts = None
 
-    if result["mode"] == "sync":
-        posts = result["posts"]
-        write_log(
-            service, "bright_sync_done", cluster_name, f"posts={len(posts)}"
-        )
-    else:
-        snapshot_id = result["snapshot_id"]
-        write_log(
-            service,
-            "bright_async_started",
-            cluster_name,
-            f"snapshot_id={snapshot_id}",
-        )
-        print("ASYNC, snapshot_id =", snapshot_id)
+    snapshot_id = result["snapshot_id"]
+    write_log(
+        service,
+        "bright_async_started",
+        cluster_name,
+        f"snapshot_id={snapshot_id}",
+    )
+    print("ASYNC, snapshot_id =", snapshot_id)
 
-        poll_sec = status_poll_sec
-        max_progress_wait = wait_bright_min * 60
-        waited = 0
+    poll_sec = status_poll_sec
+    max_progress_wait = wait_bright_min * 60
+    waited = 0
 
-        # ждём, пока progress станет ready
-        while True:
-            status = get_snapshot_status(snapshot_id)
-            write_log(service, "snapshot_status", cluster_name, status)
-            print(f"Статус снапшота: {status}, waited={waited} sec")
+    # ждём, пока progress станет ready
+    while True:
+        status = get_snapshot_status(snapshot_id)
+        write_log(service, "snapshot_status", cluster_name, status)
+        print(f"Статус снапшота: {status}, waited={waited} sec")
 
-            if status == "ready":
-                break
-            if status in ("failed", "error", "canceled", "canceling"):
-                print(
-                    f"Снапшот завершился с ошибочным статусом ({status}). Пропускаем кластер."
-                )
-                write_log(
-                    service,
-                    "snapshot_failed",
-                    cluster_name,
-                    f"status={status} waited={waited}",
-                )
-                return
+        if status == "ready":
+            break
+        if status in ("failed", "error", "canceled", "canceling"):
+            print(
+                f"Снапшот завершился с ошибочным статусом ({status}). Пропускаем кластер."
+            )
+            write_log(
+                service,
+                "snapshot_failed",
+                cluster_name,
+                f"status={status} waited={waited}",
+            )
+            return
 
-            if waited >= max_progress_wait:
-                print("Таймаут ожидания статуса ready. Пропускаем кластер.")
-                write_log(
-                    service,
-                    "snapshot_timeout_status",
-                    cluster_name,
-                    f"waited={waited}",
-                )
-                return
+        if waited >= max_progress_wait:
+            print("Таймаут ожидания статуса ready. Пропускаем кластер.")
+            write_log(
+                service,
+                "snapshot_timeout_status",
+                cluster_name,
+                f"waited={waited}",
+            )
+            return
 
-            time.sleep(poll_sec)
-            waited += poll_sec
+        time.sleep(poll_sec)
+        waited += poll_sec
 
-        # скачиваем снапшот
-        posts = download_snapshot(
-            snapshot_id,
-            max_wait_sec=wait_bright_min * 60,
-            poll_sec=poll_sec,
-        )
+    # скачиваем снапшот
+    posts = download_snapshot(
+        snapshot_id,
+        max_wait_sec=wait_bright_min * 60,
+        poll_sec=poll_sec,
+    )
 
-    # 2. Если постов нет — выходим без сна
+    # 2. Если постов нет — выходим
     if not posts:
         print(f"[{cluster_name}] Постов нет.")
         write_log(service, "no_posts", cluster_name, "0 posts")
@@ -699,6 +831,7 @@ def process_cluster(service, settings, cluster_name, cluster_data):
     # новые строки
     new_rows = []
     for p in posts:
+        followers_val = normalize_followers(p.get("profile_followers", ""))
         new_rows.append(
             [
                 p.get("url", ""),
@@ -709,7 +842,7 @@ def process_cluster(service, settings, cluster_name, cluster_data):
                 if p.get("hashtags")
                 else "",
                 p.get("profile_url", ""),
-                p.get("profile_followers", ""),
+                followers_val,
                 p.get("profile_biography", ""),
                 batch_label,
                 "",
@@ -746,7 +879,7 @@ def process_cluster(service, settings, cluster_name, cluster_data):
         f"before={len(all_rows)} after={len(deduped)}",
     )
 
-    # 6. GPT-разметка: размечаем ВСЕ незаполненные строки (без лимита)
+    # 6. GPT-разметка: размечаем ВСЕ незаполненные строки
     deduped, gpt_count = apply_gpt_labels(
         service,
         cluster_name,
@@ -755,13 +888,35 @@ def process_cluster(service, settings, cluster_name, cluster_data):
         gpt_target_column,
         gpt_label_column,
         gpt_prompt,
-        max_rows=None,
         log_every=gpt_log_every,
     )
     write_log(service, "gpt_done", cluster_name, f"processed={gpt_count}")
 
+    # Дополнительная проверка: НЕ ДВИГАЕМСЯ ДАЛЬШЕ, пока не останется строк без Y/N
+    try:
+        label_idx = header.index(gpt_label_column)
+    except ValueError:
+        label_idx = None
+
+    if label_idx is not None:
+        missing = [
+            r for r in deduped
+            if len(r) <= label_idx or not str(r[label_idx]).strip().upper() in ("Y", "N")
+        ]
+        if missing:
+            msg = f"rows_without_labels={len(missing)}"
+            print("GPT incomplete:", msg)
+            write_log(service, "gpt_incomplete", cluster_name, msg)
+            raise RuntimeError("GPT labeling incomplete, see Logs for details")
+
     # 7. Сохраняем в Google Sheets
     save_data_sheet(service, header, deduped)
+    total_rows = len(deduped) + 1  # + хедер
+
+    # 8. Протягиваем формулы H–J и форматируем колонку E как числа
+    extend_formulas_hij(service, total_rows)
+    format_column_e_numbers(service, total_rows)
+
     write_log(
         service,
         "cluster_done",
@@ -770,115 +925,64 @@ def process_cluster(service, settings, cluster_name, cluster_data):
     )
 
 
-# ---------- основной цикл ----------
+# ---------- основной запуск: один прогон по всем кластерам ----------
 
-def main_loop():
+def run_once():
     service = get_sheets_service()
-    # логируем версию один раз при старте
-    write_log(service, "version", "", BOT_VERSION)
+    write_log(service, "run_start", "", f"version={BOT_VERSION}")
 
-    while True:
+    settings = load_settings(service)
+    clusters = load_clusters(service)
+
+    active_clusters = [
+        (name, data)
+        for name, data in clusters.items()
+        if data["active"]
+    ]
+
+    if not active_clusters:
+        print("Нет активных кластеров.")
+        write_log(service, "no_active_clusters", "", "run_once")
+        return
+
+    # сортируем по order и проходим ВСЕ активные кластеры с 1 до последнего
+    active_clusters.sort(key=lambda x: x[1]["order"])
+    cluster_names = [name for name, _ in active_clusters]
+    write_log(
+        service,
+        "cluster_sequence",
+        "",
+        " -> ".join(cluster_names),
+    )
+
+    for cluster_name, cluster_data in active_clusters:
         try:
-            settings = load_settings(service)
-            sleep_between_min = int(settings.get("sleep_between_min", "5"))
-
-            bot_status = settings.get("bot_status", "off").lower()
-
-            # ждём команды запуска
-            if bot_status != "on":
-                print(
-                    "Бот в ожидании запуска (bot_status != 'on'). Ждём",
-                    sleep_between_min,
-                    "минут.",
-                )
-                write_log(
-                    service,
-                    "bot_idle",
-                    "",
-                    f"sleep {sleep_between_min} min (waiting for on)",
-                )
-                time.sleep(sleep_between_min * 60)
-                continue
-
-            # bot_status == on -> один полный цикл по кластерам
-            clusters = load_clusters(service)
-            active_clusters = [
-                (name, data)
-                for name, data in clusters.items()
-                if data["active"]
-            ]
-
-            if not active_clusters:
-                print("Нет активных кластеров для полного цикла.")
-                write_log(
-                    service,
-                    "no_active_clusters",
-                    "",
-                    "full_cycle",
-                )
-                # считаем цикл завершённым
-                update_setting(service, "bot_status", "off")
-                continue
-
-            # сортируем по order и стартуем с кластера после last_cluster_name
-            active_clusters.sort(key=lambda x: x[1]["order"])
-            names = [name for name, _ in active_clusters]
-            last = settings.get("last_cluster_name")
-            if last in names:
-                start_idx = (names.index(last) + 1) % len(names)
-            else:
-                start_idx = 0
-            ordered_names = names[start_idx:] + names[:start_idx]
-
-            print("\n===== Старт полного цикла по кластерам =====")
-            write_log(
-                service,
-                "full_cycle_start",
-                "",
-                f"clusters={len(ordered_names)}",
-            )
-
-            for cluster_name in ordered_names:
-                cluster_data = clusters[cluster_name]
-                try:
-                    process_cluster(service, settings, cluster_name, cluster_data)
-                except Exception as e:
-                    print(
-                        "Ошибка при обработке кластера",
-                        cluster_name,
-                        ":",
-                        repr(e),
-                    )
-                    write_log(
-                        service,
-                        "cluster_error",
-                        cluster_name,
-                        repr(e),
-                    )
-                finally:
-                    update_setting(service, "last_cluster_name", cluster_name)
-
-            write_log(
-                service,
-                "full_cycle_done",
-                "",
-                f"clusters={len(ordered_names)}",
-            )
-            print("Полный цикл по кластерам завершён.")
-
-            # один on = один полный цикл
-            update_setting(service, "bot_status", "off")
-            print("Установлен bot_status = 'off'. Ожидание следующего запуска.")
-
+            process_cluster(service, settings, cluster_name, cluster_data)
+            # purely информативно — можно смотреть в Settings
+            update_setting(service, "last_cluster_name", cluster_name)
         except Exception as e:
-            print("Ошибка в main_loop:", repr(e))
-            try:
-                service = get_sheets_service()
-                write_log(service, "error", "", repr(e))
-            except Exception:
-                pass
-            time.sleep(60)
+            print(
+                "Ошибка при обработке кластера",
+                cluster_name,
+                ":",
+                repr(e),
+            )
+            write_log(
+                service,
+                "cluster_error",
+                cluster_name,
+                repr(e),
+            )
+            # идём дальше к следующему кластеру, но твёрдо логируем проблему
+
+    write_log(
+        service,
+        "run_done",
+        "",
+        f"clusters={len(cluster_names)}",
+    )
+    print("Запуск завершён. Обработано кластеров:", len(cluster_names))
 
 
 if __name__ == "__main__":
-    main_loop()
+    run_once()
