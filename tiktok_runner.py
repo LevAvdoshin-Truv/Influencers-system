@@ -475,18 +475,51 @@ def main_loop():
                 snapshot_id = result["snapshot_id"]
                 write_log(service, "bright_async_started", cluster_name, f"snapshot_id={snapshot_id}")
                 print("ASYNC, snapshot_id =", snapshot_id)
-                print("Ждём", wait_bright_min, "минут...")
-                time.sleep(wait_bright_min * 60)
-                status = get_snapshot_status(snapshot_id)
-                write_log(service, "snapshot_status", cluster_name, status)
-                print("Статус снапшота:", status)
-                if status != "ready":
-                    print("Снапшот не готов, пропускаем цикл.")
-                    write_log(service, "snapshot_not_ready", cluster_name, status)
+
+                # вместо одного большого sleep — опрос статуса каждые poll_sec секунд
+                poll_sec = 60
+                max_wait_sec = wait_bright_min * 60
+                waited = 0
+                posts = None
+
+                while True:
+                    status = get_snapshot_status(snapshot_id)
+                    write_log(service, "snapshot_status", cluster_name, status)
+                    print(f"Статус снапшота: {status}, ждали уже {waited} сек")
+
+                    if status == "ready":
+                        posts = download_snapshot(snapshot_id)
+                        write_log(
+                            service,
+                            "snapshot_downloaded",
+                            cluster_name,
+                            f"posts={len(posts)} waited={waited}",
+                        )
+                        break
+
+                    if status == "failed":
+                        print("Снапшот завершился с ошибкой. Пропускаем цикл.")
+                        write_log(service, "snapshot_failed", cluster_name, f"waited={waited}")
+                        break
+
+                    if waited >= max_wait_sec:
+                        print("Превышено максимальное время ожидания снапшота. Пропускаем цикл.")
+                        write_log(service, "snapshot_timeout", cluster_name, f"waited={waited}")
+                        break
+
+                    time.sleep(poll_sec)
+                    waited += poll_sec
+
+                if not posts:
+                    print("Не удалось получить посты (async). Спим", sleep_between_min, "минут...")
+                    write_log(
+                        service,
+                        "no_posts_async",
+                        cluster_name,
+                        f"sleep {sleep_between_min} min",
+                    )
                     time.sleep(sleep_between_min * 60)
                     continue
-                posts = download_snapshot(snapshot_id)
-                write_log(service, "snapshot_downloaded", cluster_name, f"posts={len(posts)}")
 
             if not posts:
                 print("Постов нет, спим", sleep_between_min, "минут...")
@@ -521,7 +554,12 @@ def main_loop():
                 ])
 
             all_rows = old_rows + new_rows
-            write_log(service, "rows_appended", cluster_name, f"old={old_count} new={len(new_rows)} total={len(all_rows)}")
+            write_log(
+                service,
+                "rows_appended",
+                cluster_name,
+                f"old={old_count} new={len(new_rows)} total={len(all_rows)}",
+            )
 
             # дедуп по url
             seen = set()
@@ -538,7 +576,12 @@ def main_loop():
                 seen.add(url)
                 deduped.append(r)
 
-            write_log(service, "dedupe_done", cluster_name, f"before={len(all_rows)} after={len(deduped)}")
+            write_log(
+                service,
+                "dedupe_done",
+                cluster_name,
+                f"before={len(all_rows)} after={len(deduped)}",
+            )
 
             # GPT-разметка
             deduped, gpt_count = apply_gpt_labels(
