@@ -58,6 +58,8 @@ SLEEP_LOG_THROTTLE_LIMIT = 3
 _last_sleep_log_key = None
 _last_sleep_log_count = 0
 
+BOT_VERSION = "2025-11-25_01"
+
 
 # ---------- сервис Google Sheets ----------
 
@@ -357,10 +359,21 @@ def call_gpt_label(prompt_base, text):
     return "N"
 
 
-def apply_gpt_labels(header, rows, target_column, label_column, prompt_base, max_rows=None):
+def apply_gpt_labels(
+    service,
+    cluster_name,
+    header,
+    rows,
+    target_column,
+    label_column,
+    prompt_base,
+    max_rows=None,
+    log_every=10,
+):
     """
     Добавляет Y/N в label_column там, где пусто.
     Если max_rows is None — размечаем ВСЕ строки без ограничения.
+    Логируем прогресс каждые log_every записей.
     """
     try:
         text_idx = header.index(target_column)
@@ -370,6 +383,16 @@ def apply_gpt_labels(header, rows, target_column, label_column, prompt_base, max
         return rows, 0
 
     processed = 0
+
+    # считаем, сколько реально нужно разметить (для информации)
+    total_to_process = 0
+    for r in rows:
+        if len(r) < len(header):
+            r += [""] * (len(header) - len(r))
+        label = (r[label_idx] or "").strip().upper()
+        if label not in ("Y", "N"):
+            total_to_process += 1
+
     for r in rows:
         if max_rows is not None and processed >= max_rows:
             break
@@ -386,20 +409,54 @@ def apply_gpt_labels(header, rows, target_column, label_column, prompt_base, max
         r[label_idx] = yn
         processed += 1
 
+        if log_every and processed % log_every == 0:
+            write_log(
+                service,
+                "gpt_progress",
+                cluster_name,
+                f"processed={processed}/{total_to_process}",
+            )
+
+    # финальный лог
+    write_log(
+        service,
+        "gpt_progress",
+        cluster_name,
+        f"processed={processed}/{total_to_process} (final)",
+    )
+
     return rows, processed
 
 
 # ---------- Bright Data ----------
 
-def start_scrape_for_urls(urls):
+def start_scrape_for_urls(urls, limit_per_input=None, total_limit=None):
     """
     Запускает асинхронный сбор в Bright Data по списку URLs
     через /datasets/v3/trigger и возвращает snapshot_id.
+
+    limit_per_input -> query param limit_per_input (лимит на один input)
+    total_limit     -> query param limit_multiple_results (общий лимит результатов)
     """
-    trigger_url = (
-        "https://api.brightdata.com/datasets/v3/trigger"
-        f"?dataset_id={DATASET_ID}&include_errors=true&format=json"
-    )
+    base_url = "https://api.brightdata.com/datasets/v3/trigger"
+
+    params = {
+        "dataset_id": DATASET_ID,
+        "include_errors": "true",
+        "format": "json",
+    }
+
+    if limit_per_input is not None:
+        try:
+            params["limit_per_input"] = int(limit_per_input)
+        except Exception:
+            pass
+
+    if total_limit is not None:
+        try:
+            params["limit_multiple_results"] = int(total_limit)
+        except Exception:
+            pass
 
     headers = {
         "Authorization": f"Bearer {BRIGHTDATA_API_KEY}",
@@ -409,7 +466,13 @@ def start_scrape_for_urls(urls):
     # входные данные для скрейпера
     inputs = [{"url": u, "num_of_posts": DEFAULT_NUM_OF_POSTS} for u in urls]
 
-    resp = requests.post(trigger_url, headers=headers, json=inputs, timeout=180)
+    resp = requests.post(
+        base_url,
+        headers=headers,
+        params=params,
+        json=inputs,
+        timeout=180,
+    )
     print("trigger status:", resp.status_code, resp.text[:200])
 
     if resp.status_code != 200:
@@ -505,12 +568,38 @@ def process_cluster(service, settings, cluster_name, cluster_data):
     except Exception:
         cluster_limit = BASE_MAX_POSTS_PER_CLUSTER
 
+    # Bright Data: лимиты на стороне API
+    bright_limit_per_input_raw = settings.get("bright_limit_per_input", "").strip()
+    bright_total_limit_raw = settings.get("bright_total_limit", "").strip()
+
+    try:
+        bright_limit_per_input = int(bright_limit_per_input_raw) if bright_limit_per_input_raw else DEFAULT_NUM_OF_POSTS
+    except Exception:
+        bright_limit_per_input = DEFAULT_NUM_OF_POSTS
+
+    try:
+        # общий лимит по умолчанию = лимит на кластер
+        bright_total_limit = int(bright_total_limit_raw) if bright_total_limit_raw else cluster_limit
+    except Exception:
+        bright_total_limit = cluster_limit
+
+    # как часто логировать прогресс GPT
+    gpt_log_every_raw = settings.get("gpt_log_every", "10")
+    try:
+        gpt_log_every = max(1, int(gpt_log_every_raw))
+    except Exception:
+        gpt_log_every = 10
+
     print("\n================ Новый кластер ================")
     print("Кластер:", cluster_name, "URL-ов:", len(urls))
     write_log(service, "start_cluster", cluster_name, f"urls={len(urls)}")
 
     # 1. Bright Data
-    result = start_scrape_for_urls(urls)
+    result = start_scrape_for_urls(
+        urls,
+        limit_per_input=bright_limit_per_input,
+        total_limit=bright_total_limit,
+    )
     posts = None
 
     if result["mode"] == "sync":
@@ -531,7 +620,6 @@ def process_cluster(service, settings, cluster_name, cluster_data):
         poll_sec = status_poll_sec
         max_progress_wait = wait_bright_min * 60
         waited = 0
-        status = "unknown"
 
         # ждём, пока progress станет ready
         while True:
@@ -580,7 +668,7 @@ def process_cluster(service, settings, cluster_name, cluster_data):
         return
 
     original_posts_len = len(posts)
-    # ограничиваем количество постов на кластер
+    # ограничиваем количество постов на кластер уже локально (на всякий случай)
     if cluster_limit > 0 and original_posts_len > cluster_limit:
         posts = posts[:cluster_limit]
     used_posts_len = len(posts)
@@ -589,7 +677,8 @@ def process_cluster(service, settings, cluster_name, cluster_data):
         service,
         "snapshot_downloaded",
         cluster_name,
-        f"posts_original={original_posts_len} posts_used={used_posts_len} limit={cluster_limit}",
+        f"posts_original={original_posts_len} posts_used={used_posts_len} "
+        f"cluster_limit={cluster_limit} bright_total_limit={bright_total_limit}",
     )
 
     # 3. Формируем batch-метку
@@ -659,12 +748,15 @@ def process_cluster(service, settings, cluster_name, cluster_data):
 
     # 6. GPT-разметка: размечаем ВСЕ незаполненные строки (без лимита)
     deduped, gpt_count = apply_gpt_labels(
+        service,
+        cluster_name,
         header,
         deduped,
         gpt_target_column,
         gpt_label_column,
         gpt_prompt,
         max_rows=None,
+        log_every=gpt_log_every,
     )
     write_log(service, "gpt_done", cluster_name, f"processed={gpt_count}")
 
@@ -682,6 +774,8 @@ def process_cluster(service, settings, cluster_name, cluster_data):
 
 def main_loop():
     service = get_sheets_service()
+    # логируем версию один раз при старте
+    write_log(service, "version", "", BOT_VERSION)
 
     while True:
         try:
