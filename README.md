@@ -1,4 +1,5 @@
 # TikTok Scraper Bot (Bright Data + GPT + Google Sheets)
+https://docs.google.com/document/d/17AhEgIkJ-3MSd7Gb_J8ijSDB7lNVeDlpY1lwi5-QE2E/edit?tab=t.2glda09d9bdr
 
 Этот проект — автоматический бот, который каждые несколько минут:
 
@@ -103,5 +104,3 @@
 cd ~/tiktok-bot
 source ~/venv/bin/activate
 python3 tiktok_runner.py
-
-https://docs.google.com/document/d/17AhEgIkJ-3MSd7Gb_J8ijSDB7lNVeDlpY1lwi5-QE2E/edit?tab=t.2glda09d9bdr
