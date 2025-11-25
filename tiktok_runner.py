@@ -4,7 +4,7 @@ import requests
 from datetime import datetime
 
 from google.oauth2.service_account import Credentials
-from googleapicllient.discovery import build
+from googleapiclient.discovery import build
 
 # --- читаем конфиг ---
 with open("config.json", "r", encoding="utf-8") as f:
@@ -53,7 +53,7 @@ HEADER = [
     "gpt_flag",
 ]
 
-BOT_VERSION = "2025-11-25_manual_run_v5"
+BOT_VERSION = "2025-11-25_manual_run_v4"
 
 # для анти-дубляжа логов
 _last_log_key = None
@@ -165,7 +165,7 @@ def load_settings(service):
 
 
 def update_setting(service, key, new_value):
-    """Используем для last_cluster_name и т.п."""
+    """Используем, например, для last_cluster_name."""
     sheet = service.spreadsheets()
     resp = sheet.values().get(
         spreadsheetId=SPREADSHEET_ID,
@@ -236,6 +236,7 @@ def load_clusters(service):
         if name not in clusters:
             clusters[name] = {"order": order, "active": active_flag, "urls": []}
         clusters[name]["urls"].append(url)
+        # если хоть одна строка активна — считаем кластер активным
         if active_flag:
             clusters[name]["active"] = True
 
@@ -261,9 +262,10 @@ def load_data_sheet(service):
 def save_data_sheet(service, header, rows):
     """
     Сохраняем только A:H. Используем USER_ENTERED,
-    чтобы числа (в т.ч. profile_followers) стали числами, а не текстом.
+    чтобы числа (в т.ч. profile_followers) стали именно числами, а не текстом.
     """
     sheet = service.spreadsheets()
+    # выравниваем строки
     norm_rows = []
     for r in rows:
         r = r[: len(header)]
@@ -278,7 +280,7 @@ def save_data_sheet(service, header, rows):
     sheet.values().update(
         spreadsheetId=SPREADSHEET_ID,
         range=f"{SHEET_DATA}!A1",
-        valueInputOption="USER_ENTERED",
+        valueInputOption="USER_ENTERED",  # ключевая штука
         body={"values": [header] + norm_rows},
     ).execute()
 
@@ -306,7 +308,7 @@ def ensure_data_header(service):
 def normalize_followers(val):
     """
     Превращает profile_followers в целое число, если возможно.
-    Понимает '1,234', '12.3K', '4.5M', '1000'.
+    Понимает строки вида '1,234', '12.3K', '4.5M', '1000'.
     Если не получилось — возвращает исходное значение.
     """
     if val is None:
@@ -319,8 +321,10 @@ def normalize_followers(val):
     if not s:
         return ""
 
+    # удалим пробелы
     s = s.replace(" ", "")
 
+    # суффиксы k/m/b
     lower = s.lower()
     multiplier = 1
     if lower.endswith("k"):
@@ -333,6 +337,7 @@ def normalize_followers(val):
         multiplier = 1_000_000_000
         lower = lower[:-1]
 
+    # убираем разделители тысяч
     cleaned = "".join(ch for ch in lower if ch.isdigit() or ch == ".")
 
     if not cleaned:
@@ -424,7 +429,7 @@ def apply_gpt_labels(
     """
     Добавляет Y/N в label_column там, где пусто.
     Размечаем ВСЕ строки без ограничения.
-    Прогресс печатаем в консоль, в Logs пишем только start/done.
+    В SSH печатаем подробный прогресс, в Logs — только финальный статус.
     """
     try:
         text_idx = header.index(target_column)
@@ -444,19 +449,7 @@ def apply_gpt_labels(
         if label not in ("Y", "N"):
             total_to_process += 1
 
-    if total_to_process == 0:
-        msg = "no_rows_to_label"
-        print(f"GPT {cluster_name or '[GLOBAL]'}: {msg}")
-        write_log(service, "gpt_skip", cluster_name, msg)
-        return rows, 0
-
-    print(f"GPT {cluster_name or '[GLOBAL]'}: start, rows_to_label={total_to_process}")
-    write_log(
-        service,
-        "gpt_start",
-        cluster_name,
-        f"total_to_label={total_to_process}",
-    )
+    print(f"[GPT] Старт разметки ({cluster_name or 'ALL'}). Нужно обработать строк: {total_to_process}")
 
     for r in rows:
         if len(r) < len(header):
@@ -472,19 +465,18 @@ def apply_gpt_labels(
         processed += 1
 
         if log_every and processed % log_every == 0:
-            print(
-                f"GPT {cluster_name or '[GLOBAL]'}: {processed}/{total_to_process}"
-            )
+            msg = f"processed={processed}/{total_to_process}"
+            print(f"[GPT][{cluster_name or 'ALL'}] {msg}")
 
-    print(
-        f"GPT {cluster_name or '[GLOBAL]'}: done {processed}/{total_to_process}"
-    )
+    # финальный лог
+    final_msg = f"processed={processed}/{total_to_process} (final)"
     write_log(
         service,
-        "gpt_done",
-        cluster_name,
-        f"processed={processed}/{total_to_process}",
+        "gpt_progress",
+        cluster_name or "ALL",
+        final_msg,
     )
+    print(f"[GPT][{cluster_name or 'ALL'}] {final_msg}")
 
     return rows, processed
 
@@ -493,7 +485,11 @@ def apply_gpt_labels(
 
 def start_scrape_for_urls(urls, limit_per_input=None, total_limit=None):
     """
-    Запускает асинхронный сбор в Bright Data по списку URLs.
+    Запускает асинхронный сбор в Bright Data по списку URLs
+    через /datasets/v3/trigger и возвращает snapshot_id.
+
+    limit_per_input -> query param limit_per_input (лимит на один input)
+    total_limit     -> query param limit_multiple_results (общий лимит результатов)
     """
     base_url = "https://api.brightdata.com/datasets/v3/trigger"
 
@@ -520,6 +516,7 @@ def start_scrape_for_urls(urls, limit_per_input=None, total_limit=None):
         "Content-Type": "application/json",
     }
 
+    # входные данные для скрейпера
     inputs = [{"url": u, "num_of_posts": DEFAULT_NUM_OF_POSTS} for u in urls]
 
     resp = requests.post(
@@ -549,6 +546,7 @@ def start_scrape_for_urls(urls, limit_per_input=None, total_limit=None):
             "Trigger response without snapshot_id: " + resp.text[:200]
         )
 
+    # всегда async
     return {"mode": "async", "posts": None, "snapshot_id": snapshot_id}
 
 
@@ -568,7 +566,7 @@ def download_snapshot(snapshot_id, max_wait_sec=600, poll_sec=30):
     ждём и повторяем, пока не получим 200 или не упремся в max_wait_sec.
     """
     url = f"https://api.brightdata.com/datasets/v3/snapshot/{snapshot_id}?format=json"
-    headers = {"Authorization": f"Bearer {BRIGHTDATA_API_KEY}"}
+    headers = {"Authorization": f"{'Bearer ' + BRIGHTDATA_API_KEY}"}
 
     waited = 0
     while True:
@@ -581,6 +579,7 @@ def download_snapshot(snapshot_id, max_wait_sec=600, poll_sec=30):
             return data
 
         if resp.status_code == 202:
+            # снапшот ещё собирается
             print(
                 f"Snapshot building (202), waited={waited} sec, msg={resp.text[:200]}"
             )
@@ -592,6 +591,7 @@ def download_snapshot(snapshot_id, max_wait_sec=600, poll_sec=30):
             waited += poll_sec
             continue
 
+        # другая ошибка
         raise RuntimeError(f"Download error: {resp.status_code} {resp.text[:200]}")
 
 
@@ -599,7 +599,9 @@ def download_snapshot(snapshot_id, max_wait_sec=600, poll_sec=30):
 
 def extend_formulas_hij(service, last_row):
     """
-    Копирует формулы из H2:J2 на H2:J{last_row}.
+    Копирует формулы из H2:J2 на H2:J{last_row}
+    (как будто ты протянул формулы вниз).
+    Если в H/I/J формул нет, PASTE_FORMULA ничего не меняет.
     """
     if last_row < 2:
         return
@@ -684,78 +686,22 @@ def format_column_e_numbers(service, last_row):
         print("format_column_e_numbers error:", repr(e))
 
 
-# ---------- GPT-проход по таблице (после записи строк) ----------
+# ---------- обработка одного кластера ----------
 
-def label_unlabeled_rows(service, settings, cluster_name_for_log):
+def process_cluster(service, settings, cluster_name, cluster_data, with_gpt=True):
     """
-    Читает таблицу, находит строки без Y/N в gpt_flag
-    и размечает их GPT. Работает поверх уже записанных данных.
+    Полный цикл по одному кластеру:
+    Bright Data -> запись в таблицу -> дедуп -> (опционально) GPT-разметка.
     """
+    urls = cluster_data["urls"]
+    wait_bright_min = int(settings.get("wait_bright_min", "20"))
     gpt_target_column = settings.get("gpt_target_column", "profile_biography")
     gpt_label_column = settings.get("gpt_label_column", "gpt_flag")
     gpt_prompt = settings.get(
         "gpt_prompt",
         "Считай Y, если текст связан с личными финансами, деньгами или расходами пользователя. Иначе N.",
     )
-    gpt_log_every_raw = settings.get("gpt_log_every", "10")
-    try:
-        gpt_log_every = max(1, int(gpt_log_every_raw))
-    except Exception:
-        gpt_log_every = 10
-
-    ensure_data_header(service)
-    header, rows = load_data_sheet(service)
-    if not header or not rows:
-        return
-
-    # GPT-разметка всех пустых
-    rows, processed = apply_gpt_labels(
-        service,
-        cluster_name_for_log,
-        header,
-        rows,
-        gpt_target_column,
-        gpt_label_column,
-        gpt_prompt,
-        log_every=gpt_log_every,
-    )
-
-    # Дополнительная проверка: не осталось ли пустых флагов
-    try:
-        label_idx = header.index(gpt_label_column)
-    except ValueError:
-        label_idx = None
-
-    missing = []
-    if label_idx is not None:
-        for r in rows:
-            if len(r) <= label_idx:
-                missing.append(r)
-                continue
-            val = str(r[label_idx]).strip().upper()
-            if val not in ("Y", "N"):
-                missing.append(r)
-
-    if missing:
-        msg = f"rows_without_labels={len(missing)}"
-        print(f"GPT {cluster_name_for_log or '[GLOBAL]'} incomplete:", msg)
-        write_log(service, "gpt_incomplete", cluster_name_for_log, msg)
-        raise RuntimeError("GPT labeling incomplete, see Logs for details")
-
-    # сохраняем обновлённые флаги
-    save_data_sheet(service, header, rows)
-
-
-# ---------- обработка одного кластера ----------
-
-def process_cluster(service, settings, cluster_name, cluster_data):
-    """
-    Полный цикл по одному кластеру:
-    Bright Data -> запись в таблицу -> дедуп -> GPT уже по таблице.
-    """
-    urls = cluster_data["urls"]
-    wait_bright_min = int(settings.get("wait_bright_min", "20"))
-    # интервал опроса статуса Bright Data
+    # интервал опроса статуса Bright Data (по умолчанию 1 сек)
     status_poll_sec = int(settings.get("status_poll_sec", "1"))
 
     # лимит постов на кластер: Settings -> max_posts_per_cluster, потом config
@@ -765,7 +711,7 @@ def process_cluster(service, settings, cluster_name, cluster_data):
     except Exception:
         cluster_limit = BASE_MAX_POSTS_PER_CLUSTER
 
-    # Bright Data: лимиты
+    # Bright Data: лимиты на стороне API
     bright_limit_per_input_raw = settings.get("bright_limit_per_input", "").strip()
     bright_total_limit_raw = settings.get("bright_total_limit", "").strip()
 
@@ -775,9 +721,17 @@ def process_cluster(service, settings, cluster_name, cluster_data):
         bright_limit_per_input = DEFAULT_NUM_OF_POSTS
 
     try:
+        # общий лимит по умолчанию = лимит на кластер
         bright_total_limit = int(bright_total_limit_raw) if bright_total_limit_raw else cluster_limit
     except Exception:
         bright_total_limit = cluster_limit
+
+    # как часто печатать прогресс GPT (только в консоль)
+    gpt_log_every_raw = settings.get("gpt_log_every", "10")
+    try:
+        gpt_log_every = max(1, int(gpt_log_every_raw))
+    except Exception:
+        gpt_log_every = 10
 
     print("\n================ Новый кластер ================")
     print("Кластер:", cluster_name, "URL-ов:", len(urls))
@@ -802,6 +756,7 @@ def process_cluster(service, settings, cluster_name, cluster_data):
     max_progress_wait = wait_bright_min * 60
     waited = 0
 
+    # ждём, пока progress станет ready
     last_status_logged = None
     while True:
         status = get_snapshot_status(snapshot_id)
@@ -837,26 +792,25 @@ def process_cluster(service, settings, cluster_name, cluster_data):
         time.sleep(poll_sec)
         waited += poll_sec
 
-    # 2. Скачиваем снапшот
+    # скачиваем снапшот
     posts = download_snapshot(
         snapshot_id,
         max_wait_sec=wait_bright_min * 60,
         poll_sec=poll_sec,
     )
 
+    # 2. Если постов нет — выходим
     if not posts:
         print(f"[{cluster_name}] Постов нет.")
         write_log(service, "no_posts", cluster_name, "0 posts")
         return
 
     original_posts_len = len(posts)
+    # ограничиваем количество постов на кластер уже локально (на всякий случай)
     if cluster_limit > 0 and original_posts_len > cluster_limit:
         posts = posts[:cluster_limit]
     used_posts_len = len(posts)
 
-    print(
-        f"[{cluster_name}] snapshot_downloaded: posts_original={original_posts_len}, posts_used={used_posts_len}, cluster_limit={cluster_limit}"
-    )
     write_log(
         service,
         "snapshot_downloaded",
@@ -864,15 +818,16 @@ def process_cluster(service, settings, cluster_name, cluster_data):
         f"posts_original={original_posts_len} posts_used={used_posts_len} "
         f"cluster_limit={cluster_limit} bright_total_limit={bright_total_limit}",
     )
+    print(f"[{cluster_name}] Snapshot downloaded: original={original_posts_len}, used={used_posts_len}")
 
-    # 3. batch-метка
+    # 3. Формируем batch-метку
     batch_label = (
         datetime.now().strftime("%Y-%m-%d %H:%M")
         + f" | {COMMAND_NAME} | {cluster_name}"
     )
     print("batch_label:", batch_label)
 
-    # 4. Работа с таблицей: добавляем строки, дедуп, сохраняем
+    # 4. Работа с таблицей
     ensure_data_header(service)
     header, old_rows = load_data_sheet(service)
     if not header:
@@ -880,6 +835,7 @@ def process_cluster(service, settings, cluster_name, cluster_data):
 
     old_count = len(old_rows)
 
+    # новые строки
     new_rows = []
     for p in posts:
         followers_val = normalize_followers(p.get("profile_followers", ""))
@@ -901,17 +857,15 @@ def process_cluster(service, settings, cluster_name, cluster_data):
         )
 
     all_rows = old_rows + new_rows
-    print(
-        f"[{cluster_name}] rows_appended: old={old_count}, new={len(new_rows)}, total={len(all_rows)}"
-    )
     write_log(
         service,
         "rows_appended",
         cluster_name,
         f"old={old_count} new={len(new_rows)} total={len(all_rows)}",
     )
+    print(f"[{cluster_name}] rows_appended: old={old_count}, new={len(new_rows)}, total={len(all_rows)}")
 
-    # 5. Глобальный дедуп по url
+    # 5. Глобальный дедуп по url (во всей таблице)
     seen = set()
     deduped = []
     for r in all_rows:
@@ -926,17 +880,15 @@ def process_cluster(service, settings, cluster_name, cluster_data):
         seen.add(url_val)
         deduped.append(r)
 
-    print(
-        f"[{cluster_name}] dedupe_done: before={len(all_rows)}, after={len(deduped)}"
-    )
     write_log(
         service,
         "dedupe_done",
         cluster_name,
         f"before={len(all_rows)} after={len(deduped)}",
     )
+    print(f"[{cluster_name}] dedupe_done: before={len(all_rows)}, after={len(deduped)}")
 
-    # 5.5. Нормализуем profile_followers (E) во всех строках
+    # 5.5. Нормализуем profile_followers (E) во ВСЕХ строках
     try:
         followers_idx = header.index("profile_followers")
     except ValueError:
@@ -948,16 +900,45 @@ def process_cluster(service, settings, cluster_name, cluster_data):
                 r += [""] * (followers_idx + 1 - len(r))
             r[followers_idx] = normalize_followers(r[followers_idx])
 
-    # сохраняем таблицу (Новые строки уже в Google Sheets, без GPT)
-    save_data_sheet(service, header, deduped)
-    total_rows = len(deduped) + 1  # + шапка
+    # 6. GPT-разметка (опционально)
+    if with_gpt:
+        deduped, gpt_count = apply_gpt_labels(
+            service,
+            cluster_name,
+            header,
+            deduped,
+            gpt_target_column,
+            gpt_label_column,
+            gpt_prompt,
+            log_every=gpt_log_every,
+        )
+        write_log(service, "gpt_done", cluster_name, f"processed={gpt_count}")
+        print(f"[{cluster_name}] GPT done, processed={gpt_count}")
 
-    # протягиваем формулы и форматируем колонку E
+        # Дополнительная проверка: НЕ ДВИГАЕМСЯ ДАЛЬШЕ, пока не останется строк без Y/N
+        try:
+            label_idx = header.index(gpt_label_column)
+        except ValueError:
+            label_idx = None
+
+        if label_idx is not None:
+            missing = [
+                r for r in deduped
+                if len(r) <= label_idx or not str(r[label_idx]).strip().upper() in ("Y", "N")
+            ]
+            if missing:
+                msg = f"rows_without_labels={len(missing)}"
+                print("GPT incomplete:", msg)
+                write_log(service, "gpt_incomplete", cluster_name, msg)
+                raise RuntimeError("GPT labeling incomplete, see Logs for details")
+
+    # 7. Сохраняем в Google Sheets
+    save_data_sheet(service, header, deduped)
+    total_rows = len(deduped) + 1  # + хедер
+
+    # 8. Протягиваем формулы H–J и форматируем колонку E как числа
     extend_formulas_hij(service, total_rows)
     format_column_e_numbers(service, total_rows)
-
-    # 6. GPT-проход по незаполненным строкам
-    label_unlabeled_rows(service, settings, cluster_name)
 
     write_log(
         service,
@@ -965,16 +946,12 @@ def process_cluster(service, settings, cluster_name, cluster_data):
         cluster_name,
         f"rows_total={len(deduped)}",
     )
-    print(f"[{cluster_name}] кластер полностью обработан.")
+    print(f"[{cluster_name}] cluster_done, rows_total={len(deduped)}")
 
 
 # ---------- основной запуск: один прогон по всем кластерам ----------
 
-def run_once():
-    service = get_sheets_service()
-    write_log(service, "run_start", "", f"version={BOT_VERSION}")
-
-    settings = load_settings(service)
+def _run_over_active_clusters(service, settings, with_gpt=True, run_label="run"):
     clusters = load_clusters(service)
 
     active_clusters = [
@@ -985,13 +962,14 @@ def run_once():
 
     if not active_clusters:
         print("Нет активных кластеров.")
-        write_log(service, "no_active_clusters", "", "run_once")
+        write_log(service, "no_active_clusters", "", run_label)
         return
 
+    # сортируем по order и проходим ВСЕ активные кластеры с 1 до последнего
     active_clusters.sort(key=lambda x: x[1]["order"])
     cluster_names = [name for name, _ in active_clusters]
 
-    print("\nПорядок кластеров в этом запуске:")
+    print(f"\nПорядок кластеров в этом запуске ({run_label}):")
     print(" -> ".join(cluster_names))
 
     write_log(
@@ -1003,7 +981,8 @@ def run_once():
 
     for cluster_name, cluster_data in active_clusters:
         try:
-            process_cluster(service, settings, cluster_name, cluster_data)
+            process_cluster(service, settings, cluster_name, cluster_data, with_gpt=with_gpt)
+            # purely информативно — можно смотреть в Settings
             update_setting(service, "last_cluster_name", cluster_name)
         except Exception as e:
             print(
@@ -1018,15 +997,98 @@ def run_once():
                 cluster_name,
                 repr(e),
             )
+            # идём дальше к следующему кластеру, но твёрдо логируем проблему
 
     write_log(
         service,
-        "run_done",
+        f"{run_label}_done",
         "",
         f"clusters={len(cluster_names)}",
     )
-    print("Запуск завершён. Обработано кластеров:", len(cluster_names))
+    print(f"{run_label} завершён. Обработано кластеров:", len(cluster_names))
+
+
+def run_once():
+    """Полный режим: кластеры (Bright Data) + GPT по ходу."""
+    service = get_sheets_service()
+    write_log(service, "run_start", "", f"version={BOT_VERSION}")
+    print(f"[RUN] Старт полного прогона кластеров. Версия: {BOT_VERSION}")
+
+    settings = load_settings(service)
+    _run_over_active_clusters(service, settings, with_gpt=True, run_label="run")
+
+def run_scrape_only():
+    """Только Bright Data + запись в таблицу + формулы/формат. Без GPT."""
+    service = get_sheets_service()
+    write_log(service, "scrape_start", "", f"version={BOT_VERSION}")
+    print(f"[SCRAPE_ONLY] Старт. Версия: {BOT_VERSION}")
+
+    settings = load_settings(service)
+    _run_over_active_clusters(service, settings, with_gpt=False, run_label="scrape")
+
+
+def run_gpt_only(overwrite=False):
+    """
+    Режим: только GPT.
+    Берёт ВСЕ строки из TikTok_Posts и размечает колонку gpt_flag.
+    Если overwrite=True — сначала очищает колонку gpt_flag и размечает заново.
+    """
+    service = get_sheets_service()
+    settings = load_settings(service)
+
+    gpt_target_column = settings.get("gpt_target_column", "profile_biography")
+    gpt_label_column = settings.get("gpt_label_column", "gpt_flag")
+    gpt_prompt = settings.get(
+        "gpt_prompt",
+        "Считай Y, если текст связан с личными финансами, деньгами или расходами пользователя. Иначе N.",
+    )
+
+    header, rows = load_data_sheet(service)
+    if not header or not rows:
+        print("[GPT_ONLY] Лист TikTok_Posts пуст или без заголовка.")
+        return
+
+    print(f"[GPT_ONLY] Всего строк в TikTok_Posts: {len(rows)}")
+    print(f"[GPT_ONLY] Целевая колонка: {gpt_target_column}, колонка флага: {gpt_label_column}")
+
+    # по желанию можно снести старые флаги
+    if overwrite:
+        try:
+            label_idx = header.index(gpt_label_column)
+            for r in rows:
+                if len(r) <= label_idx:
+                    r += [""] * (label_idx + 1 - len(r))
+                r[label_idx] = ""
+            print("[GPT_ONLY] Все gpt_flag очищены, размечаем с нуля.")
+        except ValueError:
+            print("[GPT_ONLY] Колонка gpt_flag не найдена, пропускаем очистку.")
+
+    rows, processed = apply_gpt_labels(
+        service,
+        cluster_name="GPT_ONLY",
+        header=header,
+        rows=rows,
+        target_column=gpt_target_column,
+        label_column=gpt_label_column,
+        prompt_base=gpt_prompt,
+        log_every=10,
+    )
+
+    save_data_sheet(service, header, rows)
+    print(f"[GPT_ONLY] Готово. GPT обработал строк: {processed}")
 
 
 if __name__ == "__main__":
-    run_once()
+    import sys
+
+    mode = sys.argv[1] if len(sys.argv) > 1 else "full"
+
+    if mode == "gpt_only":
+        # только GPT по всей таблице
+        run_gpt_only(overwrite=False)
+    elif mode == "scrape_only":
+        # только выгрузка Bright Data + запись в таблицу
+        run_scrape_only()
+    else:
+        # полный цикл: Bright Data + GPT по кластерам
+        run_once()
