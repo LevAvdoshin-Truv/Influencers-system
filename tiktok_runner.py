@@ -1,4 +1,3 @@
-
 import time
 import json
 import requests
@@ -56,7 +55,7 @@ def get_sheets_service():
 def write_log(service, action, cluster_name, details):
     sheet = service.spreadsheets()
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    row = [[ts, action, cluster_name or "", details or ""]]
+    row = [[ts, action or "", cluster_name or "", details or ""]]
 
     # создадим шапку, если лист пустой
     try:
@@ -94,17 +93,17 @@ def load_settings(service):
     ).execute()
     values = resp.get("values", [])
     settings = {}
-    for row in values[1:]:  # пропускаем заголовок
+    # ожидаем, что первая строка — заголовок (key / value)
+    for row in values[1:]:
         if len(row) >= 2:
-            key = row[0].strip()
-            value = row[1].strip()
+            key = (row[0] or "").strip()
+            value = (row[1] or "").strip()
             if key:
                 settings[key] = value
     return settings
 
 
 def update_setting(service, key, new_value):
-    # простая реализация: перечитать Settings и перезаписать
     sheet = service.spreadsheets()
     resp = sheet.values().get(
         spreadsheetId=SPREADSHEET_ID,
@@ -161,20 +160,21 @@ def load_clusters(service):
     for row in rows:
         if len(row) < 4:
             continue
-        name = row[0].strip()
-        active_flag = row[1].strip().upper() == "Y"
+        name = (row[0] or "").strip()
+        if not name:
+            continue
+        active_flag = (row[1] or "").strip().upper() == "Y"
         try:
             order = int(row[2])
-        except:
+        except Exception:
             continue
-        url = row[3].strip()
+        url = (row[3] or "").strip()
         if not url:
             continue
 
         if name not in clusters:
             clusters[name] = {"order": order, "active": active_flag, "urls": []}
         clusters[name]["urls"].append(url)
-        # если хоть одна строка активна — считаем кластер активным
         if active_flag:
             clusters[name]["active"] = True
 
@@ -183,7 +183,6 @@ def load_clusters(service):
 
 def choose_next_cluster(settings, clusters):
     last = settings.get("last_cluster_name")
-    # оставляем только активные
     active_clusters = [(name, data) for name, data in clusters.items() if data["active"]]
     if not active_clusters:
         return None, None
@@ -220,7 +219,6 @@ def load_data_sheet(service):
 
 def save_data_sheet(service, header, rows):
     sheet = service.spreadsheets()
-    # нормализуем строки
     norm_rows = []
     for r in rows:
         r = r[:len(header)]
@@ -255,13 +253,13 @@ def ensure_data_header(service):
             body={"values": [HEADER]},
         ).execute()
         return HEADER
-    # можно подстроиться под существующий заголовок, но пока берём наш
     return values[0]
 
 
 # ---------- GPT ----------
 
 def call_gpt_label(prompt_base, text):
+    """Вызывает GPT и возвращает 'Y' или 'N'."""
     if not OPENAI_API_KEY:
         return "N"
 
@@ -274,37 +272,111 @@ def call_gpt_label(prompt_base, text):
         "Content-Type": "application/json",
     }
 
-    user_content = (
-        prompt_base.strip()
-        + "\n\nТекст:\n"
-        + text
-    )
+    user_content = prompt_base.strip() + "\n\nТекст:\n" + text
 
     payload = {
         "model": "gpt-4o-mini",
         "messages": [
-            {"role": "system", "content": "Ты бинарный классификатор. Отвечай только 'Y' или 'N'."},
+            {
+                "role": "system",
+                "content": "Ты бинарный классификатор. Отвечай только 'Y' или 'N'.",
+            },
             {"role": "user", "content": user_content},
         ],
         "max_tokens": 1,
         "temperature": 0,
     }
 
-        # отправляем запрос в Bright Data, даём больше времени на ответ
+    try:
+        resp = requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers=headers,
+            json=payload,
+            timeout=60,
+        )
+    except Exception as e:
+        print("GPT request error:", e)
+        return "N"
+
+    if resp.status_code != 200:
+        print("GPT HTTP error:", resp.status_code, resp.text[:200])
+        return "N"
+
+    try:
+        data = resp.json()
+        content = (
+            data.get("choices", [{}])[0]
+            .get("message", {})
+            .get("content", "")
+            .strip()
+            .upper()
+        )
+    except Exception as e:
+        print("GPT parse error:", e)
+        return "N"
+
+    if content.startswith("Y"):
+        return "Y"
+    if content.startswith("N"):
+        return "N"
+    return "N"
+
+
+def apply_gpt_labels(header, rows, target_column, label_column, prompt_base, max_rows=50):
+    """Добавляет Y/N в label_column для строк, где ещё нет значения."""
+    try:
+        text_idx = header.index(target_column)
+        label_idx = header.index(label_column)
+    except ValueError:
+        print("GPT: не найдена колонка", target_column, "или", label_column)
+        return rows, 0
+
+    processed = 0
+    for r in rows:
+        if processed >= max_rows:
+            break
+
+        if len(r) < len(header):
+            r += [""] * (len(header) - len(r))
+
+        label = (r[label_idx] or "").strip().upper()
+        if label in ("Y", "N"):
+            continue
+
+        text = r[text_idx]
+        yn = call_gpt_label(prompt_base, text)
+        r[label_idx] = yn
+        processed += 1
+
+    return rows, processed
+
+
+# ---------- Bright Data ----------
+
+def start_scrape_for_urls(urls):
+    """Запускает scrape в Bright Data по списку URLs."""
+    url = (
+        "https://api.brightdata.com/datasets/v3/scrape"
+        f"?dataset_id={DATASET_ID}&notify=false&include_errors=true"
+    )
+    headers = {"Authorization": f"Bearer {BRIGHTDATA_API_KEY}"}
+
+    inputs = [{"url": u, "num_of_posts": DEFAULT_NUM_OF_POSTS} for u in urls]
+    payload = {"input": inputs}
+
     resp = requests.post(url, headers=headers, json=payload, timeout=180)
     print("start_scrape status:", resp.status_code)
 
     if resp.status_code == 200:
         body = resp.text
 
-        # 1) сначала пробуем как нормальный JSON-массив
+        # 1) пробуем как обычный JSON-массив
         try:
             data = resp.json()
             if not isinstance(data, list):
-                # если это не массив, считаем что формат другой
                 raise ValueError("not array")
         except Exception:
-            # 2) если не получилось — парсим как NDJSON построчно
+            # 2) парсим как NDJSON построчно
             lines = [l.strip() for l in body.splitlines() if l.strip()]
             data = []
             bad_count = 0
@@ -313,14 +385,11 @@ def call_gpt_label(prompt_base, text):
                     data.append(json.loads(line))
                 except json.JSONDecodeError as e:
                     bad_count += 1
-                    # не валим весь цикл из-за одной кривой строки
                     print(f"NDJSON parse error on line {idx}: {e}")
                     continue
-
             print(f"NDJSON parsed: ok={len(data)}, bad={bad_count}")
 
         return {"mode": "sync", "posts": data, "snapshot_id": None}
-
 
     if resp.status_code == 202:
         j = resp.json()
@@ -335,7 +404,7 @@ def call_gpt_label(prompt_base, text):
 def get_snapshot_status(snapshot_id):
     url = f"https://api.brightdata.com/datasets/v3/progress/{snapshot_id}"
     headers = {"Authorization": f"Bearer {BRIGHTDATA_API_KEY}"}
-    resp = requests.get(url, headers=headers, timeout=60)
+    resp = requests.get(url, headers=headers, timeout=180)
     if resp.status_code != 200:
         raise RuntimeError(
             f"Status error: {resp.status_code} {resp.text[:200]}"
@@ -346,7 +415,7 @@ def get_snapshot_status(snapshot_id):
 def download_snapshot(snapshot_id):
     url = f"https://api.brightdata.com/datasets/v3/snapshot/{snapshot_id}?format=json"
     headers = {"Authorization": f"Bearer {BRIGHTDATA_API_KEY}"}
-    resp = requests.get(url, headers=headers, timeout=120)
+    resp = requests.get(url, headers=headers, timeout=300)
     if resp.status_code != 200:
         raise RuntimeError(
             f"Download error: {resp.status_code} {resp.text[:200]}"
@@ -496,13 +565,10 @@ def main_loop():
             try:
                 service = get_sheets_service()
                 write_log(service, "error", "", repr(e))
-            except:
+            except Exception:
                 pass
             time.sleep(60)
 
 
 if __name__ == "__main__":
     main_loop()
-
-
-
