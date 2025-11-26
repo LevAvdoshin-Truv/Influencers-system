@@ -40,6 +40,7 @@ SHEET_SETTINGS = "Settings"
 SHEET_CLUSTERS = "Clusters"
 SHEET_DATA = "TikTok_Posts"
 SHEET_LOGS = "Logs"
+SHEET_US_BASED = "US_Based"  # лист для ручного анализа US / не-US
 
 # заголовки для основного листа (A–H)
 HEADER = [
@@ -400,10 +401,10 @@ def call_gpt_label(prompt_base, text):
         data = resp.json()
         content = (
             data.get("choices", [{}])[0]
-            .get("message", {})
-            .get("content", "")
-            .strip()
-            .upper()
+                .get("message", {})
+                .get("content", "")
+                .strip()
+                .upper()
         )
     except Exception as e:
         print("GPT parse error:", e)
@@ -822,8 +823,8 @@ def process_cluster(service, settings, cluster_name, cluster_data, with_gpt=True
 
     # 3. Формируем batch-метку
     batch_label = (
-        datetime.now().strftime("%Y-%m-%d %H:%M")
-        + f" | {COMMAND_NAME} | {cluster_name}"
+            datetime.now().strftime("%Y-%m-%d %H:%M")
+            + f" | {COMMAND_NAME} | {cluster_name}"
     )
     print("batch_label:", batch_label)
 
@@ -1017,6 +1018,7 @@ def run_once():
     settings = load_settings(service)
     _run_over_active_clusters(service, settings, with_gpt=True, run_label="run")
 
+
 def run_scrape_only():
     """Только Bright Data + запись в таблицу + формулы/формат. Без GPT."""
     service = get_sheets_service()
@@ -1078,17 +1080,157 @@ def run_gpt_only(overwrite=False):
     print(f"[GPT_ONLY] Готово. GPT обработал строк: {processed}")
 
 
+# ---------- режим для вкладки US_Based ----------
+
+def run_us_based():
+    """
+    Режим: анализ листа US_Based.
+    Берём BIO (колонка C) и ставим Y/N в колонку F.
+
+    Правило:
+    - если в BIO явно указано, что это НЕ США → N
+    - если США или непонятно / не указано → Y
+    """
+    service = get_sheets_service()
+    settings = load_settings(service)
+
+    default_prompt = (
+        "Ты решаешь, относится ли TikTok-аккаунт к США.\n"
+        "Ответь 'N', если в описании (bio) явно указано, что автор или аккаунт НЕ из США "
+        "(названа другая страна или регион: UK, Canada, India, Germany, Philippines и т.п.).\n"
+        "Во всех остальных случаях, включая когда страна не указана или непонятна, ответь 'Y'.\n"
+        "Отвечай строго одной буквой: Y или N."
+    )
+    prompt = settings.get("us_based_gpt_prompt", default_prompt)
+
+    sheet = service.spreadsheets()
+
+    # Берём первые 6 колонок: A..F (BIO в C, флаг в F)
+    resp = sheet.values().get(
+        spreadsheetId=SPREADSHEET_ID,
+        range=f"{SHEET_US_BASED}!A1:F",
+    ).execute()
+    values = resp.get("values", [])
+
+    if not values or len(values) <= 1:
+        print("[US_BASED] Лист пуст или содержит только заголовок.")
+        write_log(service, "us_based_empty", SHEET_US_BASED, "no data")
+        return
+
+    header = values[0]
+    rows = values[1:]
+
+    # гарантируем 6 колонок в шапке
+    header_updated = False
+    if len(header) < 6:
+        header = header + [""] * (6 - len(header))
+        header_updated = True
+
+    # если в F1 нет заголовка — назовём его US_flag
+    if not str(header[5]).strip():
+        header[5] = "US_flag"
+        header_updated = True
+
+    if header_updated:
+        sheet.values().update(
+            spreadsheetId=SPREADSHEET_ID,
+            range=f"{SHEET_US_BASED}!A1:F1",
+            valueInputOption="USER_ENTERED",
+            body={"values": [header]},
+        ).execute()
+
+    # ищем колонку BIO по имени (case-insensitive), иначе по умолчанию берём C (индекс 2)
+    bio_idx = None
+    for i, name in enumerate(header):
+        if str(name).strip().lower() == "bio":
+            bio_idx = i
+            break
+    if bio_idx is None:
+        bio_idx = 2 if len(header) > 2 else 0
+
+    # гарантируем по 6 колонок в каждой строке
+    for i, r in enumerate(rows):
+        if len(r) < 6:
+            rows[i] = r + [""] * (6 - len(r))
+
+    total_to_process = 0
+    for r in rows:
+        label = (r[5] or "").strip().upper()
+        if label not in ("Y", "N"):
+            total_to_process += 1
+
+    print(f"[US_BASED] Всего строк: {len(rows)}, к обработке: {total_to_process}")
+    write_log(
+        service,
+        "us_based_start",
+        SHEET_US_BASED,
+        f"rows={len(rows)} to_process={total_to_process}",
+    )
+
+    if total_to_process == 0:
+        print("[US_BASED] Все строки уже размечены (Y/N) в колонке F.")
+        write_log(service, "us_based_nothing", SHEET_US_BASED, "all labeled")
+        return
+
+    processed = 0
+
+    for r in rows:
+        label = (r[5] or "").strip().upper()
+        if label in ("Y", "N"):
+            continue
+
+        bio = ""
+        if bio_idx < len(r) and r[bio_idx] is not None:
+            bio = str(r[bio_idx]).strip()
+
+        # если BIO пустой → считаем, что география не указана → Y, без GPT
+        if not bio:
+            yn = "Y"
+        else:
+            yn = call_gpt_label(prompt, bio)
+            if yn not in ("Y", "N"):
+                yn = "Y"
+
+        r[5] = yn
+        processed += 1
+
+        if processed % 10 == 0:
+            print(f"[US_BASED] processed={processed}/{total_to_process}")
+
+    # записываем только колонку F (строки 2..N)
+    flags = [[r[5]] for r in rows]
+    sheet.values().update(
+        spreadsheetId=SPREADSHEET_ID,
+        range=f"{SHEET_US_BASED}!F2:F{len(rows) + 1}",
+        valueInputOption="USER_ENTERED",
+        body={"values": flags},
+    ).execute()
+
+    write_log(
+        service,
+        "us_based_done",
+        SHEET_US_BASED,
+        f"processed={processed}/{total_to_process}",
+    )
+    print(f"[US_BASED] Готово. GPT обработал строк: {processed} из {total_to_process}")
+
+
+# ---------- точка входа ----------
+
 if __name__ == "__main__":
     import sys
 
     mode = sys.argv[1] if len(sys.argv) > 1 else "full"
 
     if mode == "gpt_only":
-        # только GPT по всей таблице
+        # только GPT по всей таблице TikTok_Posts
         run_gpt_only(overwrite=False)
     elif mode == "scrape_only":
         # только выгрузка Bright Data + запись в таблицу
         run_scrape_only()
+    elif mode == "start":
+        # анализ вкладки US_Based (BIO -> колонка F)
+        run_us_based()
     else:
         # полный цикл: Bright Data + GPT по кластерам
         run_once()
