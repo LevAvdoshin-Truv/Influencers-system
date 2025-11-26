@@ -4,7 +4,7 @@ import requests
 from datetime import datetime
 
 from google.oauth2.service_account import Credentials
-from googleapiclient.discovery import build
+from googleapicllient.discovery import build
 
 # --- читаем конфиг ---
 with open("config.json", "r", encoding="utf-8") as f:
@@ -40,7 +40,7 @@ SHEET_SETTINGS = "Settings"
 SHEET_CLUSTERS = "Clusters"
 SHEET_DATA = "TikTok_Posts"
 SHEET_LOGS = "Logs"
-SHEET_US_BASED = "US_Based"  # лист для ручного анализа US / не-US
+SHEET_US_BASED = "US_Based"
 
 # заголовки для основного листа (A–H)
 HEADER = [
@@ -351,7 +351,7 @@ def normalize_followers(val):
         return val
 
 
-# ---------- GPT ----------
+# ---------- GPT: бинарный Y/N ----------
 
 def call_gpt_label(prompt_base, text):
     """Вызывает GPT и возвращает 'Y' или 'N'."""
@@ -417,6 +417,79 @@ def call_gpt_label(prompt_base, text):
     return "N"
 
 
+# ---------- GPT: категории 1–5 для US_Based ----------
+
+def call_gpt_category_5(prompt_base, text):
+    """
+    GPT-классификация по 5 категориям.
+    Возвращает строку '1', '2', '3', '4' или '5'.
+    При ошибке/непонятке — '3' (Неизвестно).
+    """
+    if not OPENAI_API_KEY:
+        return "3"
+
+    text = (text or "").strip()
+    if not text:
+        return "3"
+
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    user_content = prompt_base.strip() + "\n\nТекст:\n" + text
+
+    payload = {
+        "model": "gpt-4o-mini",
+        "messages": [
+            {
+                "role": "system",
+                "content": "Ты классификатор. Отвечай только одной цифрой: 1, 2, 3, 4 или 5.",
+            },
+            {"role": "user", "content": user_content},
+        ],
+        "max_tokens": 1,
+        "temperature": 0,
+    }
+
+    try:
+        resp = requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers=headers,
+            json=payload,
+            timeout=60,
+        )
+    except Exception as e:
+        print("GPT request error (categories):", e)
+        return "3"
+
+    if resp.status_code != 200:
+        print("GPT HTTP error (categories):", resp.status_code, resp.text[:200])
+        return "3"
+
+    try:
+        data = resp.json()
+        content = (
+            data.get("choices", [{}])[0]
+                .get("message", {})
+                .get("content", "")
+                .strip()
+        )
+    except Exception as e:
+        print("GPT parse error (categories):", e)
+        return "3"
+
+    if not content:
+        return "3"
+
+    ch = content.strip()[0]
+    if ch in ("1", "2", "3", "4", "5"):
+        return ch
+    return "3"
+
+
+# ---------- GPT массовая разметка TikTok_Posts ----------
+
 def apply_gpt_labels(
     service,
     cluster_name,
@@ -431,6 +504,10 @@ def apply_gpt_labels(
     Добавляет Y/N в label_column там, где пусто.
     Размечаем ВСЕ строки без ограничения.
     В SSH печатаем подробный прогресс, в Logs — только финальный статус.
+
+    ДОПОЛНИТЕЛЬНО:
+    - каждые log_every строк сразу сохраняем таблицу TikTok_Posts в Google Sheets,
+      чтобы прогресс не терялся.
     """
     try:
         text_idx = header.index(target_column)
@@ -468,6 +545,11 @@ def apply_gpt_labels(
         if log_every and processed % log_every == 0:
             msg = f"processed={processed}/{total_to_process}"
             print(f"[GPT][{cluster_name or 'ALL'}] {msg}")
+            # сразу сохраняем текущий прогресс в TikTok_Posts
+            try:
+                save_data_sheet(service, header, rows)
+            except Exception as e:
+                print("[GPT] error while saving partial results:", repr(e))
 
     # финальный лог
     final_msg = f"processed={processed}/{total_to_process} (final)"
@@ -1076,6 +1158,7 @@ def run_gpt_only(overwrite=False):
         log_every=10,
     )
 
+    # финальный сброс (на всякий случай)
     save_data_sheet(service, header, rows)
     print(f"[GPT_ONLY] Готово. GPT обработал строк: {processed}")
 
@@ -1085,27 +1168,47 @@ def run_gpt_only(overwrite=False):
 def run_us_based():
     """
     Режим: анализ листа US_Based.
-    Берём BIO (колонка C) и ставим Y/N в колонку F.
+    Берём BIO (колонка C) и делаем два раунда GPT:
 
-    Правило:
-    - если в BIO явно указано, что это НЕ США → N
-    - если США или непонятно / не указано → Y
+    E (US_flag): Y / N
+      - N: если по описанию аккаунт явно НЕ из США
+      - Y: если из США или непонятно/не указано
+
+    F (US_category): 1..5
+      1 - Индивидуальный креатор, связанный с финансами / ИИ / личной эффективностью
+      2 - Индивидуальный креатор, НЕ связанный с финансами / ИИ / личной эффективностью
+      3 - Неизвестно
+      4 - Бизнес-аккаунты
+      5 - Новости / медиа / неангл. описание / гео не Америка
+
+    Каждые 10 обновлённых строк сразу пишем E и F обратно в таблицу.
     """
     service = get_sheets_service()
     settings = load_settings(service)
 
-    default_prompt = (
-        "Ты решаешь, относится ли TikTok-аккаунт к США.\n"
+    # Промпт для US_flag (Y/N)
+    default_us_flag_prompt = (
+        "Определи, относится ли TikTok-аккаунт к США.\n"
         "Ответь 'N', если в описании (bio) явно указано, что автор или аккаунт НЕ из США "
         "(названа другая страна или регион: UK, Canada, India, Germany, Philippines и т.п.).\n"
-        "Во всех остальных случаях, включая когда страна не указана или непонятна, ответь 'Y'.\n"
-        "Отвечай строго одной буквой: Y или N."
+        "Во всех остальных случаях, включая когда страна не указана или непонятна, ответь 'Y'."
     )
-    prompt = settings.get("us_based_gpt_prompt", default_prompt)
+    us_flag_prompt = settings.get("us_based_gpt_prompt", default_us_flag_prompt)
+
+    # Промпт для категорий 1–5
+    default_categories_prompt = (
+        "Классифицируй TikTok-аккаунт по описанию (bio) по одной из 5 категорий:\n"
+        "1 - Индивидуальный креатор, связанный со сферой финансов, ИИ или личной эффективностью.\n"
+        "2 - Индивидуальный креатор, не связанный с финансами, ИИ или личной эффективностью.\n"
+        "3 - Неизвестно (недостаточно информации, чтобы понять тип аккаунта).\n"
+        "4 - Бизнес-аккаунт (бренд, компания, сервис и т.п.).\n"
+        "5 - Новости / медиа / неанглоязычное описание / явно неамериканское гео.\n"
+        "Ответь строго одной цифрой: 1, 2, 3, 4 или 5."
+    )
+    categories_prompt = settings.get("us_based_categories_prompt", default_categories_prompt)
 
     sheet = service.spreadsheets()
 
-    # Берём первые 6 колонок: A..F (BIO в C, флаг в F)
     resp = sheet.values().get(
         spreadsheetId=SPREADSHEET_ID,
         range=f"{SHEET_US_BASED}!A1:F",
@@ -1120,15 +1223,22 @@ def run_us_based():
     header = values[0]
     rows = values[1:]
 
+    last_data_row = len(rows) + 1  # +1 за заголовок
+
     # гарантируем 6 колонок в шапке
     header_updated = False
     if len(header) < 6:
         header = header + [""] * (6 - len(header))
         header_updated = True
 
-    # если в F1 нет заголовка — назовём его US_flag
+    # E = US_flag
+    if not str(header[4]).strip():
+        header[4] = "US_flag"
+        header_updated = True
+
+    # F = US_category
     if not str(header[5]).strip():
-        header[5] = "US_flag"
+        header[5] = "US_category"
         header_updated = True
 
     if header_updated:
@@ -1139,7 +1249,12 @@ def run_us_based():
             body={"values": [header]},
         ).execute()
 
-    # ищем колонку BIO по имени (case-insensitive), иначе по умолчанию берём C (индекс 2)
+    # гарантируем по 6 колонок в каждой строке
+    for i, r in enumerate(rows):
+        if len(r) < 6:
+            rows[i] = r + [""] * (6 - len(r))
+
+    # вычисляем индекс BIO-колонки (ищем заголовок 'bio', иначе по умолчанию C)
     bio_idx = None
     for i, name in enumerate(header):
         if str(name).strip().lower() == "bio":
@@ -1148,15 +1263,12 @@ def run_us_based():
     if bio_idx is None:
         bio_idx = 2 if len(header) > 2 else 0
 
-    # гарантируем по 6 колонок в каждой строке
-    for i, r in enumerate(rows):
-        if len(r) < 6:
-            rows[i] = r + [""] * (6 - len(r))
-
+    # считаем, сколько строк реально нужно доразметить (E или F)
     total_to_process = 0
     for r in rows:
-        label = (r[5] or "").strip().upper()
-        if label not in ("Y", "N"):
+        flag = (r[4] or "").strip().upper()
+        cat_raw = str(r[5]).strip() if r[5] is not None else ""
+        if flag not in ("Y", "N") or cat_raw not in ("1", "2", "3", "4", "5"):
             total_to_process += 1
 
     print(f"[US_BASED] Всего строк: {len(rows)}, к обработке: {total_to_process}")
@@ -1168,43 +1280,59 @@ def run_us_based():
     )
 
     if total_to_process == 0:
-        print("[US_BASED] Все строки уже размечены (Y/N) в колонке F.")
+        print("[US_BASED] Все строки уже размечены по E и F.")
         write_log(service, "us_based_nothing", SHEET_US_BASED, "all labeled")
         return
 
     processed = 0
 
-    for r in rows:
-        label = (r[5] or "").strip().upper()
-        if label in ("Y", "N"):
+    for idx, r in enumerate(rows, start=2):  # idx — номер строки в шите (2..)
+        flag = (r[4] or "").strip().upper()
+        cat_raw = str(r[5]).strip() if r[5] is not None else ""
+
+        need_flag = flag not in ("Y", "N")
+        need_cat = cat_raw not in ("1", "2", "3", "4", "5")
+
+        if not (need_flag or need_cat):
             continue
 
         bio = ""
         if bio_idx < len(r) and r[bio_idx] is not None:
             bio = str(r[bio_idx]).strip()
 
-        # если BIO пустой → считаем, что география не указана → Y, без GPT
         if not bio:
-            yn = "Y"
+            # пустое BIO: гео не указано => Y, категория неизвестно (3)
+            if need_flag:
+                r[4] = "Y"
+            if need_cat:
+                r[5] = "3"
+            processed += 1
         else:
-            yn = call_gpt_label(prompt, bio)
-            if yn not in ("Y", "N"):
-                yn = "Y"
+            if need_flag:
+                yn = call_gpt_label(us_flag_prompt, bio)
+                if yn not in ("Y", "N"):
+                    yn = "Y"
+                r[4] = yn
+            if need_cat:
+                cat = call_gpt_category_5(categories_prompt, bio)
+                if cat not in ("1", "2", "3", "4", "5"):
+                    cat = "3"
+                r[5] = cat
+            processed += 1
 
-        r[5] = yn
-        processed += 1
-
-        if processed % 10 == 0:
+        if processed % 10 == 0 or processed == total_to_process:
             print(f"[US_BASED] processed={processed}/{total_to_process}")
-
-    # записываем только колонку F (строки 2..N)
-    flags = [[r[5]] for r in rows]
-    sheet.values().update(
-        spreadsheetId=SPREADSHEET_ID,
-        range=f"{SHEET_US_BASED}!F2:F{len(rows) + 1}",
-        valueInputOption="USER_ENTERED",
-        body={"values": flags},
-    ).execute()
+            # сохраняем E и F обратно в шит
+            ef_values = [[row[4], row[5]] for row in rows]
+            try:
+                sheet.values().update(
+                    spreadsheetId=SPREADSHEET_ID,
+                    range=f"{SHEET_US_BASED}!E2:F{len(rows) + 1}",
+                    valueInputOption="USER_ENTERED",
+                    body={"values": ef_values},
+                ).execute()
+            except Exception as e:
+                print("[US_BASED] error while saving partial E/F:", repr(e))
 
     write_log(
         service,
@@ -1223,13 +1351,13 @@ if __name__ == "__main__":
     mode = sys.argv[1] if len(sys.argv) > 1 else "full"
 
     if mode == "gpt_only":
-        # только GPT по всей таблице TikTok_Posts
+        # только GPT по основной таблице TikTok_Posts
         run_gpt_only(overwrite=False)
     elif mode == "scrape_only":
-        # только выгрузка Bright Data + запись в таблицу
+        # только выгрузка Bright Data + запись в TikTok_Posts
         run_scrape_only()
     elif mode == "start":
-        # анализ вкладки US_Based (BIO -> колонка F)
+        # режим для вкладки US_Based (двойной GPT в E и F)
         run_us_based()
     else:
         # полный цикл: Bright Data + GPT по кластерам
