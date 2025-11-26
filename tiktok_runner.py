@@ -4,7 +4,7 @@ import requests
 from datetime import datetime
 
 from google.oauth2.service_account import Credentials
-from googleapicllient.discovery import build
+from googleapiclient.discovery import build
 
 # --- читаем конфиг ---
 with open("config.json", "r", encoding="utf-8") as f:
@@ -401,10 +401,10 @@ def call_gpt_label(prompt_base, text):
         data = resp.json()
         content = (
             data.get("choices", [{}])[0]
-                .get("message", {})
-                .get("content", "")
-                .strip()
-                .upper()
+            .get("message", {})
+            .get("content", "")
+            .strip()
+            .upper()
         )
     except Exception as e:
         print("GPT parse error:", e)
@@ -471,9 +471,9 @@ def call_gpt_category_5(prompt_base, text):
         data = resp.json()
         content = (
             data.get("choices", [{}])[0]
-                .get("message", {})
-                .get("content", "")
-                .strip()
+            .get("message", {})
+            .get("content", "")
+            .strip()
         )
     except Exception as e:
         print("GPT parse error (categories):", e)
@@ -769,6 +769,60 @@ def format_column_e_numbers(service, last_row):
         print("format_column_e_numbers error:", repr(e))
 
 
+def extend_us_based_verdict_formulas(service, last_data_row, last_formula_row):
+    """
+    Протягивает формулу Verdict (колонка G) с last_formula_row до last_data_row.
+    last_* — 1-based номера строк в листе US_Based.
+    """
+    if not last_formula_row or last_formula_row < 2:
+        return
+    if last_data_row <= last_formula_row:
+        return
+
+    try:
+        sheet_id = get_sheet_id(service, SHEET_US_BASED)
+    except Exception as e:
+        print("extend_us_based_verdict_formulas get_sheet_id error:", repr(e))
+        return
+
+    # 0-based индекс строки
+    src_row_index = last_formula_row - 1
+
+    # G = 6 (0-based: A=0,B=1,C=2,D=3,E=4,F=5,G=6)
+    requests_body = {
+        "requests": [
+            {
+                "copyPaste": {
+                    "source": {
+                        "sheetId": sheet_id,
+                        "startRowIndex": src_row_index,
+                        "endRowIndex": src_row_index + 1,
+                        "startColumnIndex": 6,  # G
+                        "endColumnIndex": 7,
+                    },
+                    "destination": {
+                        "sheetId": sheet_id,
+                        "startRowIndex": src_row_index,
+                        "endRowIndex": last_data_row,
+                        "startColumnIndex": 6,
+                        "endColumnIndex": 7,
+                    },
+                    "pasteType": "PASTE_FORMULA",
+                    "pasteOrientation": "NORMAL",
+                }
+            }
+        ]
+    }
+
+    try:
+        service.spreadsheets().batchUpdate(
+            spreadsheetId=SPREADSHEET_ID,
+            body=requests_body,
+        ).execute()
+    except Exception as e:
+        print("extend_us_based_verdict_formulas error:", repr(e))
+
+
 # ---------- обработка одного кластера ----------
 
 def process_cluster(service, settings, cluster_name, cluster_data, with_gpt=True):
@@ -905,8 +959,8 @@ def process_cluster(service, settings, cluster_name, cluster_data, with_gpt=True
 
     # 3. Формируем batch-метку
     batch_label = (
-            datetime.now().strftime("%Y-%m-%d %H:%M")
-            + f" | {COMMAND_NAME} | {cluster_name}"
+        datetime.now().strftime("%Y-%m-%d %H:%M")
+        + f" | {COMMAND_NAME} | {cluster_name}"
     )
     print("batch_label:", batch_label)
 
@@ -1032,7 +1086,7 @@ def process_cluster(service, settings, cluster_name, cluster_data, with_gpt=True
     print(f"[{cluster_name}] cluster_done, rows_total={len(deduped)}")
 
 
-# ---------- основной запуск: один прогон по всем кластерам ----------
+# ---------- GPT по основной таблице ----------
 
 def _run_over_active_clusters(service, settings, with_gpt=True, run_label="run"):
     clusters = load_clusters(service)
@@ -1168,50 +1222,51 @@ def run_gpt_only(overwrite=False):
 def run_us_based():
     """
     Режим: анализ листа US_Based.
-    Берём BIO (колонка C) и делаем два раунда GPT:
 
-    E (US_flag): Y / N
-      - N: если по описанию аккаунт явно НЕ из США
-      - Y: если из США или непонятно/не указано
+    Ожидаем структуру (начиная с колонки B):
+    B: URL
+    C: BIO
+    D: Subscribers
+    E: US_flag (Y/N)
+    F: US_category (1..5)
+    G: Verdict (формула, которую надо протягивать)
 
-    F (US_category): 1..5
-      1 - Индивидуальный креатор, связанный с финансами / ИИ / личной эффективностью
-      2 - Индивидуальный креатор, НЕ связанный с финансами / ИИ / личной эффективностью
-      3 - Неизвестно
-      4 - Бизнес-аккаунты
-      5 - Новости / медиа / неангл. описание / гео не Америка
+    Два раунда GPT:
+      - US_flag (Y/N) по промпту us_based_gpt_prompt
+      - US_category (1..5) по промпту us_based_categories_prompt
 
-    Каждые 10 обновлённых строк сразу пишем E и F обратно в таблицу.
+    Каждые 10 обновлённых строк сразу сохраняем E и F.
+    В конце протягиваем формулу Verdict из последней непустой G до конца данных.
     """
     service = get_sheets_service()
     settings = load_settings(service)
+    sheet = service.spreadsheets()
 
     # Промпт для US_flag (Y/N)
     default_us_flag_prompt = (
-        "Определи, относится ли TikTok-аккаунт к США.\n"
-        "Ответь 'N', если в описании (bio) явно указано, что автор или аккаунт НЕ из США "
-        "(названа другая страна или регион: UK, Canada, India, Germany, Philippines и т.п.).\n"
-        "Во всех остальных случаях, включая когда страна не указана или непонятна, ответь 'Y'."
+        "Return 'N' if text clearly indicates that the creator is not from the US "
+        "(for example: UK, India, Philippines, Canada, Europe, Africa, Asia, etc). "
+        "In all other cases, including when the country is not mentioned or not obvious, return 'Y'. "
+        "Answer with a single letter: Y or N."
     )
     us_flag_prompt = settings.get("us_based_gpt_prompt", default_us_flag_prompt)
 
     # Промпт для категорий 1–5
     default_categories_prompt = (
-        "Классифицируй TikTok-аккаунт по описанию (bio) по одной из 5 категорий:\n"
-        "1 - Индивидуальный креатор, связанный со сферой финансов, ИИ или личной эффективностью.\n"
-        "2 - Индивидуальный креатор, не связанный с финансами, ИИ или личной эффективностью.\n"
-        "3 - Неизвестно (недостаточно информации, чтобы понять тип аккаунта).\n"
-        "4 - Бизнес-аккаунт (бренд, компания, сервис и т.п.).\n"
-        "5 - Новости / медиа / неанглоязычное описание / явно неамериканское гео.\n"
-        "Ответь строго одной цифрой: 1, 2, 3, 4 или 5."
+        "Analyze the text (TikTok bio) and assign exactly one label from the list below. "
+        "Output only the label number (1, 2, 3, 4, or 5).\n"
+        "1 - Individual creator related to finance, AI, or personal productivity.\n"
+        "2 - Individual creator NOT related to finance, AI, or personal productivity.\n"
+        "3 - Unknown (not enough information to tell).\n"
+        "4 - Business account (brand, company, service, etc.).\n"
+        "5 - News account, non-English description, or clearly non-US geo."
     )
     categories_prompt = settings.get("us_based_categories_prompt", default_categories_prompt)
 
-    sheet = service.spreadsheets()
-
+    # Берём B1:G — 6 колонок: URL, BIO, Subscribers, US_flag, US_category, Verdict
     resp = sheet.values().get(
         spreadsheetId=SPREADSHEET_ID,
-        range=f"{SHEET_US_BASED}!A1:F",
+        range=f"{SHEET_US_BASED}!B1:G",
     ).execute()
     values = resp.get("values", [])
 
@@ -1223,52 +1278,52 @@ def run_us_based():
     header = values[0]
     rows = values[1:]
 
-    last_data_row = len(rows) + 1  # +1 за заголовок
-
-    # гарантируем 6 колонок в шапке
+    # гарантируем минимум 6 колонок в шапке
     header_updated = False
     if len(header) < 6:
         header = header + [""] * (6 - len(header))
         header_updated = True
 
-    # E = US_flag
-    if not str(header[4]).strip():
-        header[4] = "US_flag"
-        header_updated = True
+    # индексы относительно B:
+    BIO_COL = 1       # C
+    US_FLAG_COL = 3   # E
+    US_CAT_COL = 4    # F
+    VERDICT_COL = 5   # G
 
-    # F = US_category
-    if not str(header[5]).strip():
-        header[5] = "US_category"
+    # гарантируем имена колонок E/F
+    if not str(header[US_FLAG_COL]).strip():
+        header[US_FLAG_COL] = "US_flag"
+        header_updated = True
+    if not str(header[US_CAT_COL]).strip():
+        header[US_CAT_COL] = "US_category"
         header_updated = True
 
     if header_updated:
         sheet.values().update(
             spreadsheetId=SPREADSHEET_ID,
-            range=f"{SHEET_US_BASED}!A1:F1",
+            range=f"{SHEET_US_BASED}!B1:G1",
             valueInputOption="USER_ENTERED",
             body={"values": [header]},
         ).execute()
 
-    # гарантируем по 6 колонок в каждой строке
+    # выравниваем строки до длины шапки
+    max_cols = len(header)
     for i, r in enumerate(rows):
-        if len(r) < 6:
-            rows[i] = r + [""] * (6 - len(r))
+        if len(r) < max_cols:
+            rows[i] = r + [""] * (max_cols - len(r))
 
-    # вычисляем индекс BIO-колонки (ищем заголовок 'bio', иначе по умолчанию C)
-    bio_idx = None
-    for i, name in enumerate(header):
-        if str(name).strip().lower() == "bio":
-            bio_idx = i
-            break
-    if bio_idx is None:
-        bio_idx = 2 if len(header) > 2 else 0
+    # находим последнюю непустую строку в Verdict (G)
+    last_verdict_row = None  # 1-based номер строки листа
+    for idx, r in enumerate(rows, start=2):  # строки 2..N
+        if len(r) > VERDICT_COL and str(r[VERDICT_COL]).strip():
+            last_verdict_row = idx
 
-    # считаем, сколько строк реально нужно доразметить (E или F)
+    # считаем, сколько строк нужно обработать
     total_to_process = 0
     for r in rows:
-        flag = (r[4] or "").strip().upper()
-        cat_raw = str(r[5]).strip() if r[5] is not None else ""
-        if flag not in ("Y", "N") or cat_raw not in ("1", "2", "3", "4", "5"):
+        flag_val = (r[US_FLAG_COL] or "").strip().upper()
+        cat_val = str(r[US_CAT_COL]).strip() if r[US_CAT_COL] is not None else ""
+        if flag_val not in ("Y", "N") or cat_val not in ("1", "2", "3", "4", "5"):
             total_to_process += 1
 
     print(f"[US_BASED] Всего строк: {len(rows)}, к обработке: {total_to_process}")
@@ -1280,59 +1335,78 @@ def run_us_based():
     )
 
     if total_to_process == 0:
-        print("[US_BASED] Все строки уже размечены по E и F.")
+        print("[US_BASED] Все строки уже размечены по US_flag и US_category.")
+        if last_verdict_row:
+            extend_us_based_verdict_formulas(
+                service,
+                last_data_row=len(rows) + 1,
+                last_formula_row=last_verdict_row,
+            )
         write_log(service, "us_based_nothing", SHEET_US_BASED, "all labeled")
         return
 
     processed = 0
 
-    for idx, r in enumerate(rows, start=2):  # idx — номер строки в шите (2..)
-        flag = (r[4] or "").strip().upper()
-        cat_raw = str(r[5]).strip() if r[5] is not None else ""
+    for r in rows:
+        flag_val = (r[US_FLAG_COL] or "").strip().upper()
+        cat_val = str(r[US_CAT_COL]).strip() if r[US_CAT_COL] is not None else ""
 
-        need_flag = flag not in ("Y", "N")
-        need_cat = cat_raw not in ("1", "2", "3", "4", "5")
+        need_flag = flag_val not in ("Y", "N")
+        need_cat = cat_val not in ("1", "2", "3", "4", "5")
 
         if not (need_flag or need_cat):
             continue
 
         bio = ""
-        if bio_idx < len(r) and r[bio_idx] is not None:
-            bio = str(r[bio_idx]).strip()
+        if BIO_COL < len(r) and r[BIO_COL] is not None:
+            bio = str(r[BIO_COL]).strip()
 
         if not bio:
-            # пустое BIO: гео не указано => Y, категория неизвестно (3)
+            # пустое BIO: считаем, что страна не указана, тип неизвестен
             if need_flag:
-                r[4] = "Y"
+                r[US_FLAG_COL] = "Y"
             if need_cat:
-                r[5] = "3"
-            processed += 1
+                r[US_CAT_COL] = "3"
         else:
             if need_flag:
                 yn = call_gpt_label(us_flag_prompt, bio)
                 if yn not in ("Y", "N"):
                     yn = "Y"
-                r[4] = yn
+                r[US_FLAG_COL] = yn
             if need_cat:
                 cat = call_gpt_category_5(categories_prompt, bio)
                 if cat not in ("1", "2", "3", "4", "5"):
                     cat = "3"
-                r[5] = cat
-            processed += 1
+                r[US_CAT_COL] = cat
+
+        processed += 1
 
         if processed % 10 == 0 or processed == total_to_process:
             print(f"[US_BASED] processed={processed}/{total_to_process}")
-            # сохраняем E и F обратно в шит
-            ef_values = [[row[4], row[5]] for row in rows]
-            try:
-                sheet.values().update(
-                    spreadsheetId=SPREADSHEET_ID,
-                    range=f"{SHEET_US_BASED}!E2:F{len(rows) + 1}",
-                    valueInputOption="USER_ENTERED",
-                    body={"values": ef_values},
-                ).execute()
-            except Exception as e:
-                print("[US_BASED] error while saving partial E/F:", repr(e))
+            ef_values = [[row[US_FLAG_COL], row[US_CAT_COL]] for row in rows]
+            sheet.values().update(
+                spreadsheetId=SPREADSHEET_ID,
+                range=f"{SHEET_US_BASED}!E2:F{len(rows) + 1}",
+                valueInputOption="USER_ENTERED",
+                body={"values": ef_values},
+            ).execute()
+
+    # финальный сброс E/F
+    ef_values = [[r[US_FLAG_COL], r[US_CAT_COL]] for r in rows]
+    sheet.values().update(
+        spreadsheetId=SPREADSHEET_ID,
+        range=f"{SHEET_US_BASED}!E2:F{len(rows) + 1}",
+        valueInputOption="USER_ENTERED",
+        body={"values": ef_values},
+    ).execute()
+
+    # протягиваем Verdict (G) от последней непустой строки до конца данных
+    if last_verdict_row:
+        extend_us_based_verdict_formulas(
+            service,
+            last_data_row=len(rows) + 1,  # +1 за заголовок
+            last_formula_row=last_verdict_row,
+        )
 
     write_log(
         service,
@@ -1354,10 +1428,10 @@ if __name__ == "__main__":
         # только GPT по основной таблице TikTok_Posts
         run_gpt_only(overwrite=False)
     elif mode == "scrape_only":
-        # только выгрузка Bright Data + запись в TikTok_Posts
+        # только выгрузка Bright Data + запись в таблицу
         run_scrape_only()
     elif mode == "start":
-        # режим для вкладки US_Based (двойной GPT в E и F)
+        # режим для вкладки US_Based (двойной GPT + протяжка Verdict)
         run_us_based()
     else:
         # полный цикл: Bright Data + GPT по кластерам
