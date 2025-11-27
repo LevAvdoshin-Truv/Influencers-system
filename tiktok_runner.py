@@ -424,7 +424,7 @@ def call_gpt_label(prompt_base, text):
     user_content = prompt_base.strip() + "\n\nТекст:\n" + text
 
     payload = {
-        "model": "gpt-4o-mini",
+        "model": "gpt-5-mini",
         "messages": [
             {
                 "role": "system",
@@ -494,7 +494,7 @@ def call_gpt_category_5(prompt_base, text):
     user_content = prompt_base.strip() + "\n\nТекст:\n" + text
 
     payload = {
-        "model": "gpt-4o-mini",
+        "model": "gpt-5-mini",
         "messages": [
             {
                 "role": "system",
@@ -553,15 +553,17 @@ def apply_gpt_labels(
     label_column,
     prompt_base,
     log_every=10,
+    continue_from_last_nonempty=True,
 ):
     """
-    Добавляет Y/N в label_column там, где пусто.
-    Размечаем ВСЕ строки без ограничения.
-    В SSH печатаем подробный прогресс, в Logs — только финальный статус.
+    Добавляет Y/N в label_column.
 
-    ДОПОЛНИТЕЛЬНО:
-    - каждые log_every строк сохраняем ТОЛЬКО колонку с GPT-метками
-      в Google Sheets (без очистки и перезаписи всего листа).
+    НОВОЕ:
+    - если continue_from_last_nonempty=True, то начинаем разметку
+      с первой строки ПОСЛЕ последней строки, где label_column не пустая.
+      (для TikTok_Posts это H = gpt_flag)
+
+    Каждые log_every строк сохраняем только колонку label_column в Google Sheets.
     """
     try:
         text_idx = header.index(target_column)
@@ -570,25 +572,54 @@ def apply_gpt_labels(
         print("GPT: не найдена колонка", target_column, "или", label_column)
         return rows, 0
 
-    processed = 0
-
-    # считаем, сколько реально нужно разметить (для информации)
-    total_to_process = 0
-    for r in rows:
+    # выравниваем строки до длины шапки
+    for i, r in enumerate(rows):
         if len(r) < len(header):
-            r += [""] * (len(header) - len(r))
+            rows[i] = r + [""] * (len(header) - len(r))
+
+    # определяем стартовый индекс
+    start_index = 0
+    if continue_from_last_nonempty and rows:
+        last_nonempty = None
+        for idx in range(len(rows) - 1, -1, -1):
+            val = (rows[idx][label_idx] or "").strip()
+            if val:
+                last_nonempty = idx
+                break
+        if last_nonempty is not None:
+            start_index = last_nonempty + 1
+
+    if start_index >= len(rows):
+        msg = f"nothing_to_process start_index={start_index}, total_rows={len(rows)}"
+        print(f"[GPT][{cluster_name or 'ALL'}] {msg}")
+        write_log(service, "gpt_progress", cluster_name or "ALL", msg)
+        return rows, 0
+
+    # считаем, сколько реально нужно разметить начиная с start_index
+    total_to_process = 0
+    for r in rows[start_index:]:
         label = (r[label_idx] or "").strip().upper()
         if label not in ("Y", "N"):
             total_to_process += 1
 
-    print(f"[GPT] Старт разметки ({cluster_name or 'ALL'}). Нужно обработать строк: {total_to_process}")
+    if total_to_process == 0:
+        msg = f"nothing_to_process_after_index start_row={start_index + 2}"
+        print(f"[GPT][{cluster_name or 'ALL'}] {msg}")
+        write_log(service, "gpt_progress", cluster_name or "ALL", msg)
+        return rows, 0
 
-    for r in rows:
-        if len(r) < len(header):
-            r += [""] * (len(header) - len(r))
+    print(
+        f"[GPT] Старт разметки ({cluster_name or 'ALL'}). "
+        f"Стартовая строка листа: {start_index + 2}, всего к обработке: {total_to_process}"
+    )
 
+    processed = 0
+
+    for row_idx in range(start_index, len(rows)):
+        r = rows[row_idx]
         label = (r[label_idx] or "").strip().upper()
         if label in ("Y", "N"):
+            # вдруг кто-то уже руками проставил
             continue
 
         text = r[text_idx]
@@ -599,14 +630,22 @@ def apply_gpt_labels(
         if log_every and processed % log_every == 0:
             msg = f"processed={processed}/{total_to_process}"
             print(f"[GPT][{cluster_name or 'ALL'}] {msg}")
-            # сохраняем только колонку label_column (например gpt_flag),
-            # не трогая остальные данные в TikTok_Posts
             try:
                 save_gpt_labels_only(service, header, rows, label_column)
             except Exception as e:
                 print("[GPT] error while saving partial GPT labels:", repr(e))
 
-    # финальный лог
+    # финальный лог + проверка, всё ли разметили в хвосте
+    missing_count = 0
+    first_missing_row = None
+    for row_idx in range(start_index, len(rows)):
+        r = rows[row_idx]
+        label = (r[label_idx] or "").strip().upper()
+        if label not in ("Y", "N"):
+            missing_count += 1
+            if first_missing_row is None:
+                first_missing_row = row_idx + 2  # +1 за заголовок, +1 за индекс
+
     final_msg = f"processed={processed}/{total_to_process} (final)"
     write_log(
         service,
@@ -615,6 +654,14 @@ def apply_gpt_labels(
         final_msg,
     )
     print(f"[GPT][{cluster_name or 'ALL'}] {final_msg}")
+
+    if missing_count:
+        msg = (
+            f"rows_without_labels_after_gpt={missing_count}, "
+            f"first_row={first_missing_row}"
+        )
+        print("GPT incomplete:", msg)
+        write_log(service, "gpt_incomplete", cluster_name or "ALL", msg)
 
     return rows, processed
 
@@ -1106,23 +1153,9 @@ def process_cluster(service, settings, cluster_name, cluster_data, with_gpt=True
         )
         write_log(service, "gpt_done", cluster_name, f"processed={gpt_count}")
         print(f"[{cluster_name}] GPT done, processed={gpt_count}")
-
-        # Дополнительная проверка: НЕ ДВИГАЕМСЯ ДАЛЬШЕ, пока не останется строк без Y/N
-        try:
-            label_idx = header.index(gpt_label_column)
-        except ValueError:
-            label_idx = None
-
-        if label_idx is not None:
-            missing = [
-                r for r in deduped
-                if len(r) <= label_idx or not str(r[label_idx]).strip().upper() in ("Y", "N")
-            ]
-            if missing:
-                msg = f"rows_without_labels={len(missing)}"
-                print("GPT incomplete:", msg)
-                write_log(service, "gpt_incomplete", cluster_name, msg)
-                raise RuntimeError("GPT labeling incomplete, see Logs for details")
+        # Раньше здесь была строгая проверка, что в колонке gpt_flag нет пустых значений.
+        # Теперь GPT размечает данные инкрементально, начиная с последней непустой строки,
+        # поэтому допускаем незаполненные строки выше этой границы.
 
     # 7. Сохраняем в Google Sheets (здесь по-прежнему перезаписываем весь диапазон A:H, это логично после дедупа)
     save_data_sheet(service, header, deduped)
@@ -1248,10 +1281,10 @@ def run_gpt_only(overwrite=False):
     if overwrite:
         try:
             label_idx = header.index(gpt_label_column)
-            for r in rows:
+            for i, r in enumerate(rows):
                 if len(r) <= label_idx:
-                    r += [""] * (label_idx + 1 - len(r))
-                r[label_idx] = ""
+                    rows[i] = r + [""] * (label_idx + 1 - len(r))
+                rows[i][label_idx] = ""
             print("[GPT_ONLY] Все gpt_flag очищены, размечаем с нуля.")
         except ValueError:
             print("[GPT_ONLY] Колонка gpt_flag не найдена, пропускаем очистку.")
@@ -1286,12 +1319,9 @@ def run_us_based():
     F: US_category (1..5)
     G: Verdict (формула, которую надо протягивать)
 
-    Два раунда GPT:
-      - US_flag (Y/N) по промпту us_based_gpt_prompt
-      - US_category (1..5) по промпту us_based_categories_prompt
-
-    Каждые 10 обновлённых строк сразу сохраняем E и F.
-    В конце протягиваем формулу Verdict из последней непустой G до конца данных.
+    НОВОЕ:
+    - GPT продолжает работу СТРОГО с первой строки после последней строки,
+      где и E, и F уже заполнены (не пустые).
     """
     service = get_sheets_service()
     settings = load_settings(service)
@@ -1373,24 +1403,40 @@ def run_us_based():
         if len(r) > VERDICT_COL and str(r[VERDICT_COL]).strip():
             last_verdict_row = idx
 
-    # считаем, сколько строк нужно обработать
+    # Ищем последнюю строку, где и E, и F не пустые
+    start_index = 0  # индекс в массиве rows (0 = строка 2 в листе)
+    if rows:
+        last_full_labeled = None
+        for idx in range(len(rows) - 1, -1, -1):
+            flag_val = (rows[idx][US_FLAG_COL] or "").strip()
+            cat_val = (rows[idx][US_CAT_COL] or "").strip()
+            if flag_val and cat_val:
+                last_full_labeled = idx
+                break
+        if last_full_labeled is not None:
+            start_index = last_full_labeled + 1  # начинаем с следующей строки
+
+    # считаем, сколько нужно обработать, начиная с start_index
     total_to_process = 0
-    for r in rows:
+    for r in rows[start_index:]:
         flag_val = (r[US_FLAG_COL] or "").strip().upper()
         cat_val = str(r[US_CAT_COL]).strip() if r[US_CAT_COL] is not None else ""
         if flag_val not in ("Y", "N") or cat_val not in ("1", "2", "3", "4", "5"):
             total_to_process += 1
 
-    print(f"[US_BASED] Всего строк: {len(rows)}, к обработке: {total_to_process}")
+    print(
+        f"[US_BASED] Всего строк: {len(rows)}, "
+        f"стартуем с строки листа {start_index + 2}, к обработке: {total_to_process}"
+    )
     write_log(
         service,
         "us_based_start",
         SHEET_US_BASED,
-        f"rows={len(rows)} to_process={total_to_process}",
+        f"rows={len(rows)} to_process={total_to_process} start_row={start_index + 2}",
     )
 
     if total_to_process == 0:
-        print("[US_BASED] Все строки уже размечены по US_flag и US_category.")
+        print("[US_BASED] Все строки после стартовой уже размечены по US_flag и US_category.")
         if last_verdict_row:
             extend_us_based_verdict_formulas(
                 service,
@@ -1402,7 +1448,9 @@ def run_us_based():
 
     processed = 0
 
-    for r in rows:
+    for row_idx in range(start_index, len(rows)):
+        r = rows[row_idx]
+
         flag_val = (r[US_FLAG_COL] or "").strip().upper()
         cat_val = str(r[US_CAT_COL]).strip() if r[US_CAT_COL] is not None else ""
 
