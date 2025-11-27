@@ -501,7 +501,7 @@ def call_gpt_category_5(prompt_base, text):
             },
             {"role": "user", "content": user_content},
         ],
-        "max_completion_tokens": 1,
+        "max_completion_tokens": 16,
     }
 
     try:
