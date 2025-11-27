@@ -264,6 +264,9 @@ def save_data_sheet(service, header, rows):
     """
     Сохраняем только A:H. Используем USER_ENTERED,
     чтобы числа (в т.ч. profile_followers) стали именно числами, а не текстом.
+
+    Используется для "жёсткой" перезаписи таблицы (дедуп, новые посты и т.п.).
+    GPT-прогресс теперь сохраняется отдельной функцией, чтобы не трогать весь лист.
     """
     sheet = service.spreadsheets()
     # выравниваем строки
@@ -284,6 +287,57 @@ def save_data_sheet(service, header, rows):
         valueInputOption="USER_ENTERED",  # ключевая штука
         body={"values": [header] + norm_rows},
     ).execute()
+
+
+# --- новый helper: сохраняем только GPT-колонку (без clear всего листа) ---
+
+def _idx_to_col_letter(idx: int) -> str:
+    """
+    Превращает 0-based индекс колонки (0=A,1=B,...) в буквы Excel/Sheets (A,B,...,Z,AA,...).
+    """
+    n = idx
+    s = ""
+    while True:
+        n, r = divmod(n, 26)
+        s = chr(ord("A") + r) + s
+        if n == 0:
+            break
+        n -= 1
+    return s
+
+
+def save_gpt_labels_only(service, header, rows, label_column):
+    """
+    Обновляет в листе TikTok_Posts только одну колонку с GPT-метками
+    (например, gpt_flag) без очистки всего диапазона A:H.
+
+    Используется при пошаговой разметке (каждые 10 строк) и в режиме gpt_only.
+    """
+    try:
+        label_idx = header.index(label_column)
+    except ValueError:
+        print("save_gpt_labels_only: колонка не найдена:", label_column)
+        return
+
+    col_letter = _idx_to_col_letter(label_idx)
+
+    # только значения по этой колонке (строки 2..N, без заголовка)
+    col_values = []
+    for r in rows:
+        if len(r) <= label_idx:
+            r = r + [""] * (label_idx + 1 - len(r))
+        col_values.append([r[label_idx]])
+
+    sheet = service.spreadsheets()
+    try:
+        sheet.values().update(
+            spreadsheetId=SPREADSHEET_ID,
+            range=f"{SHEET_DATA}!{col_letter}2:{col_letter}{len(rows) + 1}",
+            valueInputOption="USER_ENTERED",
+            body={"values": col_values},
+        ).execute()
+    except Exception as e:
+        print("save_gpt_labels_only error:", repr(e))
 
 
 def ensure_data_header(service):
@@ -506,8 +560,8 @@ def apply_gpt_labels(
     В SSH печатаем подробный прогресс, в Logs — только финальный статус.
 
     ДОПОЛНИТЕЛЬНО:
-    - каждые log_every строк сразу сохраняем таблицу TikTok_Posts в Google Sheets,
-      чтобы прогресс не терялся.
+    - каждые log_every строк сохраняем ТОЛЬКО колонку с GPT-метками
+      в Google Sheets (без очистки и перезаписи всего листа).
     """
     try:
         text_idx = header.index(target_column)
@@ -545,11 +599,12 @@ def apply_gpt_labels(
         if log_every and processed % log_every == 0:
             msg = f"processed={processed}/{total_to_process}"
             print(f"[GPT][{cluster_name or 'ALL'}] {msg}")
-            # сразу сохраняем текущий прогресс в TikTok_Posts
+            # сохраняем только колонку label_column (например gpt_flag),
+            # не трогая остальные данные в TikTok_Posts
             try:
-                save_data_sheet(service, header, rows)
+                save_gpt_labels_only(service, header, rows, label_column)
             except Exception as e:
-                print("[GPT] error while saving partial results:", repr(e))
+                print("[GPT] error while saving partial GPT labels:", repr(e))
 
     # финальный лог
     final_msg = f"processed={processed}/{total_to_process} (final)"
@@ -1069,7 +1124,7 @@ def process_cluster(service, settings, cluster_name, cluster_data, with_gpt=True
                 write_log(service, "gpt_incomplete", cluster_name, msg)
                 raise RuntimeError("GPT labeling incomplete, see Logs for details")
 
-    # 7. Сохраняем в Google Sheets
+    # 7. Сохраняем в Google Sheets (здесь по-прежнему перезаписываем весь диапазон A:H, это логично после дедупа)
     save_data_sheet(service, header, deduped)
     total_rows = len(deduped) + 1  # + хедер
 
@@ -1212,8 +1267,8 @@ def run_gpt_only(overwrite=False):
         log_every=10,
     )
 
-    # финальный сброс (на всякий случай)
-    save_data_sheet(service, header, rows)
+    # финальный сброс: сохраняем только колонку с метками, без clear и без перезаписи всего листа
+    save_gpt_labels_only(service, header, rows, gpt_label_column)
     print(f"[GPT_ONLY] Готово. GPT обработал строк: {processed}")
 
 
