@@ -408,20 +408,37 @@ def normalize_followers(val):
 # ---------- GPT: бинарный Y/N ----------
 
 def call_gpt_label(prompt_base, text):
-    """Вызывает GPT и возвращает 'Y' или 'N'."""
+    """
+    Вызывает GPT и возвращает 'Y' или 'N'.
+
+    Логика (как ты хотел):
+    - Решает именно GPT.
+    - ДЕФОЛТ — 'Y':
+        * если нет ключа,
+        * если текст пустой,
+        * если HTTP-ошибка / ошибка сети / парсинга,
+        * если ответ GPT НЕ начинается с 'N'.
+    - 'N' ставится ТОЛЬКО если GPT очень явно начал ответ с буквы 'N'.
+    """
+    # по умолчанию считаем, что всё ок -> Y
+    DEFAULT_LABEL = "Y"
+
     if not OPENAI_API_KEY:
-        return "N"
+        return DEFAULT_LABEL
 
     text = (text or "").strip()
+    prompt_base = (prompt_base or "").strip()
+
+    # твой кейс: пустой текст => Y по умолчанию
     if not text:
-        return "N"
+        return DEFAULT_LABEL
 
     headers = {
         "Authorization": f"Bearer {OPENAI_API_KEY}",
         "Content-Type": "application/json",
     }
 
-    user_content = prompt_base.strip() + "\n\nТекст:\n" + text
+    user_content = prompt_base + "\n\nТекст:\n" + text
 
     payload = {
         "model": "gpt-5-mini",
@@ -432,7 +449,9 @@ def call_gpt_label(prompt_base, text):
             },
             {"role": "user", "content": user_content},
         ],
+        # не 1 токен, чтобы не ловить ошибку "не успел закончить ответ"
         "max_completion_tokens": 16,
+        # temperature не указываем — для этой модели оно фиксированное
     }
 
     try:
@@ -444,30 +463,32 @@ def call_gpt_label(prompt_base, text):
         )
     except Exception as e:
         print("GPT request error:", e)
-        return "N"
+        return DEFAULT_LABEL
 
     if resp.status_code != 200:
         print("GPT HTTP error:", resp.status_code, resp.text[:200])
-        return "N"
+        return DEFAULT_LABEL
 
     try:
         data = resp.json()
-        content = (
+        raw_content = (
             data.get("choices", [{}])[0]
             .get("message", {})
             .get("content", "")
-            .strip()
-            .upper()
         )
+        if raw_content is None:
+            raw_content = ""
+        content = raw_content.strip().upper()
     except Exception as e:
         print("GPT parse error:", e)
-        return "N"
+        return DEFAULT_LABEL
 
-    if content.startswith("Y"):
-        return "Y"
+    # ЯВНОЕ 'N' от модели (N, NO, N., N\n, ...)
     if content.startswith("N"):
         return "N"
-    return "N"
+
+    # Все остальные ответы (Y, YES, вообще любой текст) -> Y
+    return DEFAULT_LABEL
 
 
 # ---------- GPT: категории 1–5 для US_Based ----------
@@ -490,7 +511,7 @@ def call_gpt_category_5(prompt_base, text):
         "Content-Type": "application/json",
     }
 
-    user_content = prompt_base.strip() + "\n\nТекст:\n" + text
+    user_content = (prompt_base or "").strip() + "\n\nТекст:\n" + text
 
     payload = {
         "model": "gpt-5-mini",
@@ -501,7 +522,7 @@ def call_gpt_category_5(prompt_base, text):
             },
             {"role": "user", "content": user_content},
         ],
-        "max_completion_tokens": 16,
+        "max_completion_tokens": 8,
     }
 
     try:
@@ -521,12 +542,14 @@ def call_gpt_category_5(prompt_base, text):
 
     try:
         data = resp.json()
-        content = (
+        raw_content = (
             data.get("choices", [{}])[0]
             .get("message", {})
             .get("content", "")
-            .strip()
         )
+        if raw_content is None:
+            raw_content = ""
+        content = raw_content.strip()
     except Exception as e:
         print("GPT parse error (categories):", e)
         return "3"
@@ -534,7 +557,7 @@ def call_gpt_category_5(prompt_base, text):
     if not content:
         return "3"
 
-    ch = content.strip()[0]
+    ch = content[0]
     if ch in ("1", "2", "3", "4", "5"):
         return ch
     return "3"
@@ -1151,11 +1174,10 @@ def process_cluster(service, settings, cluster_name, cluster_data, with_gpt=True
         )
         write_log(service, "gpt_done", cluster_name, f"processed={gpt_count}")
         print(f"[{cluster_name}] GPT done, processed={gpt_count}")
-        # Раньше здесь была строгая проверка, что в колонке gpt_flag нет пустых значений.
-        # Теперь GPT размечает данные инкрементально, начиная с последней непустой строки,
-        # поэтому допускаем незаполненные строки выше этой границы.
+        # Здесь больше нет жёсткой проверки "все ли строки размечены Y/N".
+        # GPT размечает инкрементально, поэтому допускаем старые значения выше.
 
-    # 7. Сохраняем в Google Sheets (здесь по-прежнему перезаписываем весь диапазон A:H, это логично после дедупа)
+    # 7. Сохраняем в Google Sheets (после дедупа — логично перезаписать A:H)
     save_data_sheet(service, header, deduped)
     total_rows = len(deduped) + 1  # + хедер
 
@@ -1527,6 +1549,8 @@ if __name__ == "__main__":
 
     if mode == "gpt_only":
         # только GPT по основной таблице TikTok_Posts
+        # ВАЖНО: если хочешь один раз всё пересчитать с нуля —
+        # временно поменяй на overwrite=True.
         run_gpt_only(overwrite=False)
     elif mode == "scrape_only":
         # только выгрузка Bright Data + запись в таблицу
