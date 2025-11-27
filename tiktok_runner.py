@@ -432,7 +432,7 @@ def call_gpt_label(prompt_base, text):
             },
             {"role": "user", "content": user_content},
         ],
-        "max_tokens": 1,
+        "max_completion_tokens": 1,
         "temperature": 0,
     }
 
