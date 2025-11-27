@@ -433,7 +433,6 @@ def call_gpt_label(prompt_base, text):
             {"role": "user", "content": user_content},
         ],
         "max_completion_tokens": 1,
-        "temperature": 0,
     }
 
     try:
@@ -502,8 +501,7 @@ def call_gpt_category_5(prompt_base, text):
             },
             {"role": "user", "content": user_content},
         ],
-        "max_tokens": 1,
-        "temperature": 0,
+        "max_completion_tokens": 1,
     }
 
     try:
