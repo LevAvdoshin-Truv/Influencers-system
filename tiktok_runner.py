@@ -409,36 +409,25 @@ def normalize_followers(val):
 
 def call_gpt_label(prompt_base, text):
     """
-    Вызывает GPT и возвращает 'Y' или 'N'.
-
-    Логика (как ты хотел):
-    - Решает именно GPT.
-    - ДЕФОЛТ — 'Y':
-        * если нет ключа,
-        * если текст пустой,
-        * если HTTP-ошибка / ошибка сети / парсинга,
-        * если ответ GPT НЕ начинается с 'N'.
-    - 'N' ставится ТОЛЬКО если GPT очень явно начал ответ с буквы 'N'.
+    Вызывает GPT и возвращает ЕГО ответ как есть (обычно 'Y' или 'N').
+    НИКАКИХ доп. правил:
+    - не мапим к Y/N,
+    - не ставим дефолты.
+    Если ошибка / нет ключа / не смогли распарсить — возвращаем пустую строку.
     """
-    # по умолчанию считаем, что всё ок -> Y
-    DEFAULT_LABEL = "Y"
-
     if not OPENAI_API_KEY:
-        return DEFAULT_LABEL
+        return ""
 
     text = (text or "").strip()
-    prompt_base = (prompt_base or "").strip()
-
-    # твой кейс: пустой текст => Y по умолчанию
     if not text:
-        return DEFAULT_LABEL
+        return ""
 
     headers = {
         "Authorization": f"Bearer {OPENAI_API_KEY}",
         "Content-Type": "application/json",
     }
 
-    user_content = prompt_base + "\n\nТекст:\n" + text
+    user_content = (prompt_base or "").strip() + "\n\nТекст:\n" + text
 
     payload = {
         "model": "gpt-5-mini",
@@ -449,9 +438,7 @@ def call_gpt_label(prompt_base, text):
             },
             {"role": "user", "content": user_content},
         ],
-        # не 1 токен, чтобы не ловить ошибку "не успел закончить ответ"
-        "max_completion_tokens": 16,
-        # temperature не указываем — для этой модели оно фиксированное
+        "max_completion_tokens": 8,
     }
 
     try:
@@ -463,32 +450,27 @@ def call_gpt_label(prompt_base, text):
         )
     except Exception as e:
         print("GPT request error:", e)
-        return DEFAULT_LABEL
+        return ""
 
     if resp.status_code != 200:
         print("GPT HTTP error:", resp.status_code, resp.text[:200])
-        return DEFAULT_LABEL
+        return ""
 
     try:
         data = resp.json()
-        raw_content = (
+        content = (
             data.get("choices", [{}])[0]
             .get("message", {})
             .get("content", "")
         )
-        if raw_content is None:
-            raw_content = ""
-        content = raw_content.strip().upper()
     except Exception as e:
         print("GPT parse error:", e)
-        return DEFAULT_LABEL
+        return ""
 
-    # ЯВНОЕ 'N' от модели (N, NO, N., N\n, ...)
-    if content.startswith("N"):
-        return "N"
+    if content is None:
+        return ""
 
-    # Все остальные ответы (Y, YES, вообще любой текст) -> Y
-    return DEFAULT_LABEL
+    return str(content).strip()
 
 
 # ---------- GPT: категории 1–5 для US_Based ----------
@@ -496,15 +478,18 @@ def call_gpt_label(prompt_base, text):
 def call_gpt_category_5(prompt_base, text):
     """
     GPT-классификация по 5 категориям.
-    Возвращает строку '1', '2', '3', '4' или '5'.
-    При ошибке/непонятке — '3' (Неизвестно).
+
+    ВАЖНО:
+    - просто возвращаем ответ модели как строку (обычно '1'..'5').
+    - никаких дефолтов, маппингов и проверок.
+    Ошибки / пустой текст -> пустая строка.
     """
     if not OPENAI_API_KEY:
-        return "3"
+        return ""
 
     text = (text or "").strip()
     if not text:
-        return "3"
+        return ""
 
     headers = {
         "Authorization": f"Bearer {OPENAI_API_KEY}",
@@ -534,33 +519,27 @@ def call_gpt_category_5(prompt_base, text):
         )
     except Exception as e:
         print("GPT request error (categories):", e)
-        return "3"
+        return ""
 
     if resp.status_code != 200:
         print("GPT HTTP error (categories):", resp.status_code, resp.text[:200])
-        return "3"
+        return ""
 
     try:
         data = resp.json()
-        raw_content = (
+        content = (
             data.get("choices", [{}])[0]
             .get("message", {})
             .get("content", "")
         )
-        if raw_content is None:
-            raw_content = ""
-        content = raw_content.strip()
     except Exception as e:
         print("GPT parse error (categories):", e)
-        return "3"
+        return ""
 
-    if not content:
-        return "3"
+    if content is None:
+        return ""
 
-    ch = content[0]
-    if ch in ("1", "2", "3", "4", "5"):
-        return ch
-    return "3"
+    return str(content).strip()
 
 
 # ---------- GPT массовая разметка TikTok_Posts ----------
@@ -577,14 +556,13 @@ def apply_gpt_labels(
     continue_from_last_nonempty=True,
 ):
     """
-    Добавляет Y/N в label_column.
+    Добавляет метки в label_column.
 
-    НОВОЕ:
+    Логика:
+    - считаем строку "готовой", если label_column НЕ пустая (любой текст);
+    - GPT вызываем только для пустых ячеек;
     - если continue_from_last_nonempty=True, то начинаем разметку
       с первой строки ПОСЛЕ последней строки, где label_column не пустая.
-      (для TikTok_Posts это H = gpt_flag)
-
-    Каждые log_every строк сохраняем только колонку label_column в Google Sheets.
     """
     try:
         text_idx = header.index(target_column)
@@ -598,7 +576,7 @@ def apply_gpt_labels(
         if len(r) < len(header):
             rows[i] = r + [""] * (len(header) - len(r))
 
-    # определяем стартовый индекс
+    # определяем стартовый индекс (по последней НЕпустой ячейке)
     start_index = 0
     if continue_from_last_nonempty and rows:
         last_nonempty = None
@@ -619,8 +597,8 @@ def apply_gpt_labels(
     # считаем, сколько реально нужно разметить начиная с start_index
     total_to_process = 0
     for r in rows[start_index:]:
-        label = (r[label_idx] or "").strip().upper()
-        if label not in ("Y", "N"):
+        label = (r[label_idx] or "").strip()
+        if not label:
             total_to_process += 1
 
     if total_to_process == 0:
@@ -638,9 +616,9 @@ def apply_gpt_labels(
 
     for row_idx in range(start_index, len(rows)):
         r = rows[row_idx]
-        label = (r[label_idx] or "").strip().upper()
-        if label in ("Y", "N"):
-            # вдруг кто-то уже руками проставил
+        label = (r[label_idx] or "").strip()
+        if label:
+            # если уже что-то есть — считаем строку размеченной и не трогаем
             continue
 
         text = r[text_idx]
@@ -661,8 +639,8 @@ def apply_gpt_labels(
     first_missing_row = None
     for row_idx in range(start_index, len(rows)):
         r = rows[row_idx]
-        label = (r[label_idx] or "").strip().upper()
-        if label not in ("Y", "N"):
+        label = (r[label_idx] or "").strip()
+        if not label:
             missing_count += 1
             if first_missing_row is None:
                 first_missing_row = row_idx + 2  # +1 за заголовок, +1 за индекс
@@ -1174,8 +1152,8 @@ def process_cluster(service, settings, cluster_name, cluster_data, with_gpt=True
         )
         write_log(service, "gpt_done", cluster_name, f"processed={gpt_count}")
         print(f"[{cluster_name}] GPT done, processed={gpt_count}")
-        # Здесь больше нет жёсткой проверки "все ли строки размечены Y/N".
-        # GPT размечает инкрементально, поэтому допускаем старые значения выше.
+        # Здесь больше нет жёсткой проверки "все ли строки размечены".
+        # GPT размечает инкрементально, поэтому допускаем пустые значения выше/ниже.
 
     # 7. Сохраняем в Google Sheets (после дедупа — логично перезаписать A:H)
     save_data_sheet(service, header, deduped)
@@ -1335,19 +1313,20 @@ def run_us_based():
     B: URL
     C: BIO
     D: Subscribers
-    E: US_flag (Y/N)
-    F: US_category (1..5)
+    E: US_flag
+    F: US_category
     G: Verdict (формула, которую надо протягивать)
 
     НОВОЕ:
     - GPT продолжает работу СТРОГО с первой строки после последней строки,
       где и E, и F уже заполнены (не пустые).
+    - Ответы GPT по E и F просто копируются как есть, без доп. логики.
     """
     service = get_sheets_service()
     settings = load_settings(service)
     sheet = service.spreadsheets()
 
-    # Промпт для US_flag (Y/N)
+    # Промпт для US_flag
     default_us_flag_prompt = (
         "Return 'N' if text clearly indicates that the creator is not from the US "
         "(for example: UK, India, Philippines, Canada, Europe, Africa, Asia, etc). "
@@ -1439,9 +1418,9 @@ def run_us_based():
     # считаем, сколько нужно обработать, начиная с start_index
     total_to_process = 0
     for r in rows[start_index:]:
-        flag_val = (r[US_FLAG_COL] or "").strip().upper()
-        cat_val = str(r[US_CAT_COL]).strip() if r[US_CAT_COL] is not None else ""
-        if flag_val not in ("Y", "N") or cat_val not in ("1", "2", "3", "4", "5"):
+        flag_val = (r[US_FLAG_COL] or "").strip()
+        cat_val = (r[US_CAT_COL] or "").strip()
+        if (not flag_val) or (not cat_val):
             total_to_process += 1
 
     print(
@@ -1471,36 +1450,26 @@ def run_us_based():
     for row_idx in range(start_index, len(rows)):
         r = rows[row_idx]
 
-        flag_val = (r[US_FLAG_COL] or "").strip().upper()
-        cat_val = str(r[US_CAT_COL]).strip() if r[US_CAT_COL] is not None else ""
+        flag_val = (r[US_FLAG_COL] or "").strip()
+        cat_val = (r[US_CAT_COL] or "").strip()
 
-        need_flag = flag_val not in ("Y", "N")
-        need_cat = cat_val not in ("1", "2", "3", "4", "5")
+        need_flag = not flag_val
+        need_cat = not cat_val
 
         if not (need_flag or need_cat):
             continue
 
         bio = ""
         if BIO_COL < len(r) and r[BIO_COL] is not None:
-            bio = str(r[BIO_COL]).strip()
+            bio = str(r[BIO_COL])
 
-        if not bio:
-            # пустое BIO: считаем, что страна не указана, тип неизвестен
-            if need_flag:
-                r[US_FLAG_COL] = "Y"
-            if need_cat:
-                r[US_CAT_COL] = "3"
-        else:
-            if need_flag:
-                yn = call_gpt_label(us_flag_prompt, bio)
-                if yn not in ("Y", "N"):
-                    yn = "Y"
-                r[US_FLAG_COL] = yn
-            if need_cat:
-                cat = call_gpt_category_5(categories_prompt, bio)
-                if cat not in ("1", "2", "3", "4", "5"):
-                    cat = "3"
-                r[US_CAT_COL] = cat
+        if need_flag:
+            yn = call_gpt_label(us_flag_prompt, bio)
+            r[US_FLAG_COL] = yn
+
+        if need_cat:
+            cat = call_gpt_category_5(categories_prompt, bio)
+            r[US_CAT_COL] = cat
 
         processed += 1
 
@@ -1549,8 +1518,7 @@ if __name__ == "__main__":
 
     if mode == "gpt_only":
         # только GPT по основной таблице TikTok_Posts
-        # ВАЖНО: если хочешь один раз всё пересчитать с нуля —
-        # временно поменяй на overwrite=True.
+        # если нужно пересчитать всё с нуля — запусти с overwrite=True
         run_gpt_only(overwrite=False)
     elif mode == "scrape_only":
         # только выгрузка Bright Data + запись в таблицу
