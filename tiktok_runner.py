@@ -54,7 +54,7 @@ HEADER = [
     "gpt_flag",
 ]
 
-BOT_VERSION = "2025-11-25_manual_run_v4"
+BOT_VERSION = "2025-11-28_gpt5mini_stream_v1"
 
 # для анти-дубляжа логов
 _last_log_key = None
@@ -155,6 +155,8 @@ def load_settings(service):
     ).execute()
     values = resp.get("values", [])
     settings = {}
+    if not values:
+        return settings
     # пропускаем заголовок
     for row in values[1:]:
         if len(row) >= 2:
@@ -262,15 +264,11 @@ def load_data_sheet(service):
 
 def save_data_sheet(service, header, rows):
     """
-    Сохраняем только A:H. Используем USER_ENTERED,
-    чтобы числа (в т.ч. profile_followers) стали именно числами, а не текстом.
-
-    Используется для "жёсткой" перезаписи таблицы (дедуп, новые посты и т.п.).
-    GPT-прогресс сохраняется отдельной функцией, чтобы не трогать весь лист
-    во время gpt_only.
+    Старая функция "жёсткой" перезаписи A:H.
+    Сейчас больше НЕ используется (чтобы не чистить весь лист),
+    но оставлена на всякий случай.
     """
     sheet = service.spreadsheets()
-    # выравниваем строки
     norm_rows = []
     for r in rows:
         r = r[: len(header)]
@@ -311,8 +309,6 @@ def save_gpt_labels_only(service, header, rows, label_column):
     """
     Обновляет в листе TikTok_Posts только одну колонку с GPT-метками
     (например, gpt_flag) без очистки всего диапазона A:H.
-
-    Используется при пошаговой разметке (каждая строка).
     """
     try:
         label_idx = header.index(label_column)
@@ -322,7 +318,6 @@ def save_gpt_labels_only(service, header, rows, label_column):
 
     col_letter = _idx_to_col_letter(label_idx)
 
-    # только значения по этой колонке (строки 2..N, без заголовка)
     col_values = []
     for r in rows:
         if len(r) <= label_idx:
@@ -377,10 +372,8 @@ def normalize_followers(val):
     if not s:
         return ""
 
-    # удалим пробелы
     s = s.replace(" ", "")
 
-    # суффиксы k/m/b
     lower = s.lower()
     multiplier = 1
     if lower.endswith("k"):
@@ -393,7 +386,6 @@ def normalize_followers(val):
         multiplier = 1_000_000_000
         lower = lower[:-1]
 
-    # убираем разделители тысяч
     cleaned = "".join(ch for ch in lower if ch.isdigit() or ch == ".")
 
     if not cleaned:
@@ -406,41 +398,40 @@ def normalize_followers(val):
         return val
 
 
-# ---------- GPT: бинарный Y/N ----------
+# ---------- GPT: бинарный классификатор (ответ как есть) ----------
 
 def call_gpt_label(prompt_base, text):
     """
-    Вызывает GPT-5-mini и ВОЗВРАЩАЕТ РОВНО ТО, ЧТО ОН НАПИСАЛ.
+    Вызывает GPT и возвращает РОВНО то, что модель ответила
+    (после .strip()). Никакой внутренней логики Y/N в Python.
 
-    Никакой дополнительной логики:
-    - не ставим дефолтные Y/N;
-    - не проверяем первую букву;
-    - не переводим в upper;
-    - просто .strip() и назад.
-
-    При любой ошибке/400/исключении — возвращаем пустую строку,
-    чтобы в таблице было видно, что что-то пошло не так.
+    Если ошибка/нет ключа/HTTP 400 — возвращается "" и колонка
+    остаётся как есть.
     """
     if not OPENAI_API_KEY:
         return ""
+
+    if text is None:
+        text = ""
+    else:
+        text = str(text)
 
     headers = {
         "Authorization": f"Bearer {OPENAI_API_KEY}",
         "Content-Type": "application/json",
     }
 
-    user_content = (prompt_base or "").strip() + "\n\nТекст:\n" + (text or "")
+    user_content = prompt_base.strip() + "\n\nТекст:\n" + text
 
     payload = {
         "model": "gpt-5-mini",
         "messages": [
             {
                 "role": "system",
-                "content": "Ты бинарный классификатор. Отвечай только 'Y' или 'N'.",
+                "content": "Ты классификатор. Отвечай КРАТКО и строго согласно промпту пользователя.",
             },
             {"role": "user", "content": user_content},
         ],
-        "max_completion_tokens": 16,
     }
 
     try:
@@ -460,51 +451,48 @@ def call_gpt_label(prompt_base, text):
 
     try:
         data = resp.json()
-        raw_content = (
+        content = (
             data.get("choices", [{}])[0]
             .get("message", {})
             .get("content", "")
         )
-        if raw_content is None:
-            raw_content = ""
-        return raw_content.strip()
+        return (content or "").strip()
     except Exception as e:
         print("GPT parse error:", e)
         return ""
 
 
-# ---------- GPT: категории 1–5 для US_Based ----------
+# ---------- GPT: категории 1–5 для US_Based (ответ как есть) ----------
 
 def call_gpt_category_5(prompt_base, text):
     """
-    GPT-классификация по 5 категориям.
-    Возвращает строку '1', '2', '3', '4' или '5'.
-    При ошибке/непонятке — '3' (Неизвестно).
+    GPT-классификация. Возвращаем РОВНО то, что сказал GPT (strip()).
+    Никакой авто-подстановки '3' и т.п. в Python.
     """
     if not OPENAI_API_KEY:
-        return "3"
+        return ""
 
-    text = (text or "").strip()
-    if not text:
-        return "3"
+    if text is None:
+        text = ""
+    else:
+        text = str(text)
 
     headers = {
         "Authorization": f"Bearer {OPENAI_API_KEY}",
         "Content-Type": "application/json",
     }
 
-    user_content = (prompt_base or "").strip() + "\n\nТекст:\n" + text
+    user_content = prompt_base.strip() + "\n\nТекст:\n" + text
 
     payload = {
         "model": "gpt-5-mini",
         "messages": [
             {
                 "role": "system",
-                "content": "Ты классификатор. Отвечай только одной цифрой: 1, 2, 3, 4 или 5.",
+                "content": "Ты классификатор. Отвечай строго согласно промпту пользователя.",
             },
             {"role": "user", "content": user_content},
         ],
-        "max_completion_tokens": 8,
     }
 
     try:
@@ -516,33 +504,23 @@ def call_gpt_category_5(prompt_base, text):
         )
     except Exception as e:
         print("GPT request error (categories):", e)
-        return "3"
+        return ""
 
     if resp.status_code != 200:
         print("GPT HTTP error (categories):", resp.status_code, resp.text[:200])
-        return "3"
+        return ""
 
     try:
         data = resp.json()
-        raw_content = (
+        content = (
             data.get("choices", [{}])[0]
             .get("message", {})
             .get("content", "")
         )
-        if raw_content is None:
-            raw_content = ""
-        content = raw_content.strip()
+        return (content or "").strip()
     except Exception as e:
         print("GPT parse error (categories):", e)
-        return "3"
-
-    if not content:
-        return "3"
-
-    ch = content[0]
-    if ch in ("1", "2", "3", "4", "5"):
-        return ch
-    return "3"
+        return ""
 
 
 # ---------- GPT массовая разметка TikTok_Posts ----------
@@ -558,20 +536,16 @@ def apply_gpt_labels(
     log_every=10,
 ):
     """
-    Добавляет значение GPT в label_column.
+    Идём ВСЕГДА сверху вниз по всем строкам.
+    НИЧЕГО не запоминаем "с последней непустой".
 
     Логика:
-    - идём СВЕРХУ ВНИЗ по всем строкам;
-    - пропускаем строки, где label_column уже НЕ пустая
-      (то есть руками можно править, и GPT это не затрёт);
-    - для каждой новой строки:
-        * вызываем GPT
-        * пишем ответ в rows
-        * сразу сохраняем всю колонку в Google Sheets.
-
-    Никакого "продолжить с последней непустой" — всегда проходим весь лист.
+    - если label_column уже НЕ пустая -> не трогаем;
+    - если label_column пустая -> шлём текст в GPT;
+    - что вернул GPT -> пишем в label_column;
+    - после КАЖДОЙ строки пушим всю колонку в Google Sheets,
+      чтобы прогресс сохранялся в реал-тайме.
     """
-
     try:
         text_idx = header.index(target_column)
         label_idx = header.index(label_column)
@@ -583,6 +557,8 @@ def apply_gpt_labels(
     for i, r in enumerate(rows):
         if len(r) < len(header):
             rows[i] = r + [""] * (len(header) - len(r))
+        elif len(r) > len(header):
+            rows[i] = r[: len(header)]
 
     total_to_process = 0
     for r in rows:
@@ -591,39 +567,40 @@ def apply_gpt_labels(
             total_to_process += 1
 
     if total_to_process == 0:
-        msg = "nothing_to_process: все строки уже имеют gpt_flag"
+        msg = "nothing_to_process: все метки уже заполнены"
         print(f"[GPT][{cluster_name or 'ALL'}] {msg}")
         write_log(service, "gpt_progress", cluster_name or "ALL", msg)
         return rows, 0
 
     print(
         f"[GPT] Старт разметки ({cluster_name or 'ALL'}). "
-        f"Всего строк: {len(rows)}, к обработке (пустых): {total_to_process}"
+        f"Всего к обработке строк (label пустой): {total_to_process}"
     )
 
     processed = 0
 
     for row_idx, r in enumerate(rows):
-        label = (r[label_idx] or "").strip()
-        if label:
-            # уже есть какое-то значение — не трогаем
+        current_label = (r[label_idx] or "").strip()
+        if current_label:
             continue
 
-        text = r[text_idx]
-        yn = call_gpt_label(prompt_base, text)
-        r[label_idx] = yn
+        text = r[text_idx] if text_idx < len(r) else ""
+        gpt_answer = call_gpt_label(prompt_base, text)
+
+        if gpt_answer != "":
+            r[label_idx] = gpt_answer
+
         processed += 1
 
-        # лог в консоль — раз в log_every строк
-        if log_every and processed % log_every == 0:
-            msg = f"processed={processed}/{total_to_process} (row={row_idx + 2})"
-            print(f"[GPT][{cluster_name or 'ALL'}] {msg}")
-
-        # сохраняем прогресс в Google Sheets ПОСЛЕ КАЖДОЙ НОВОЙ СТРОКИ
+        # сохраняем прогресс КАЖДУЮ строку
         try:
             save_gpt_labels_only(service, header, rows, label_column)
         except Exception as e:
-            print("[GPT] error while saving GPT labels:", repr(e))
+            print("[GPT] error while saving partial GPT labels:", repr(e))
+
+        if log_every and processed % log_every == 0:
+            msg = f"processed={processed}/{total_to_process}"
+            print(f"[GPT][{cluster_name or 'ALL'}] {msg}")
 
     final_msg = f"processed={processed}/{total_to_process} (final)"
     write_log(
@@ -641,11 +618,8 @@ def apply_gpt_labels(
 
 def start_scrape_for_urls(urls, limit_per_input=None, total_limit=None):
     """
-    Запускает асинхронный сбор в Bright Data по списку URLs
-    через /datasets/v3/trigger и возвращает snapshot_id.
-
-    limit_per_input -> query param limit_per_input (лимит на один input)
-    total_limit     -> query param limit_multiple_results (общий лимит результатов)
+    Запускает асинхронный сбор в Bright Data по списку URLs.
+    Возвращает snapshot_id.
     """
     base_url = "https://api.brightdata.com/datasets/v3/trigger"
 
@@ -672,7 +646,6 @@ def start_scrape_for_urls(urls, limit_per_input=None, total_limit=None):
         "Content-Type": "application/json",
     }
 
-    # входные данные для скрейпера
     inputs = [{"url": u, "num_of_posts": DEFAULT_NUM_OF_POSTS} for u in urls]
 
     resp = requests.post(
@@ -702,7 +675,6 @@ def start_scrape_for_urls(urls, limit_per_input=None, total_limit=None):
             "Trigger response without snapshot_id: " + resp.text[:200]
         )
 
-    # всегда async
     return {"mode": "async", "posts": None, "snapshot_id": snapshot_id}
 
 
@@ -735,7 +707,6 @@ def download_snapshot(snapshot_id, max_wait_sec=600, poll_sec=30):
             return data
 
         if resp.status_code == 202:
-            # снапшот ещё собирается
             print(
                 f"Snapshot building (202), waited={waited} sec, msg={resp.text[:200]}"
             )
@@ -747,7 +718,6 @@ def download_snapshot(snapshot_id, max_wait_sec=600, poll_sec=30):
             waited += poll_sec
             continue
 
-        # другая ошибка
         raise RuntimeError(f"Download error: {resp.status_code} {resp.text[:200]}")
 
 
@@ -757,7 +727,6 @@ def extend_formulas_hij(service, last_row):
     """
     Копирует формулы из H2:J2 на H2:J{last_row}
     (как будто ты протянул формулы вниз).
-    Если в H/I/J формул нет, PASTE_FORMULA ничего не меняет.
     """
     if last_row < 2:
         return
@@ -773,12 +742,12 @@ def extend_formulas_hij(service, last_row):
                         "startRowIndex": 1,   # row 2
                         "endRowIndex": 2,
                         "startColumnIndex": 7,  # H
-                        "endColumnIndex": 10,   # J (исключительно)
+                        "endColumnIndex": 10,   # J
                     },
                     "destination": {
                         "sheetId": sheet_id,
                         "startRowIndex": 1,   # row 2
-                        "endRowIndex": last_row,  # до последней строки
+                        "endRowIndex": last_row,
                         "startColumnIndex": 7,
                         "endColumnIndex": 10,
                     },
@@ -858,10 +827,8 @@ def extend_us_based_verdict_formulas(service, last_data_row, last_formula_row):
         print("extend_us_based_verdict_formulas get_sheet_id error:", repr(e))
         return
 
-    # 0-based индекс строки
     src_row_index = last_formula_row - 1
 
-    # G = 6 (0-based: A=0,B=1,C=2,D=3,E=4,F=5,G=6)
     requests_body = {
         "requests": [
             {
@@ -901,7 +868,11 @@ def extend_us_based_verdict_formulas(service, last_data_row, last_formula_row):
 def process_cluster(service, settings, cluster_name, cluster_data, with_gpt=True):
     """
     Полный цикл по одному кластеру:
-    Bright Data -> запись в таблицу -> дедуп -> (опционально) GPT-разметка.
+    Bright Data -> добавление строчек в TikTok_Posts -> (опционально) GPT-разметка.
+
+    ВАЖНО:
+    - НЕ чистим и НЕ перезаливаем весь лист TikTok_Posts.
+    - Только ДОПИСЫВАЕМ новые строки (и протягиваем формулы/формат).
     """
     urls = cluster_data["urls"]
     wait_bright_min = int(settings.get("wait_bright_min", "20"))
@@ -909,19 +880,16 @@ def process_cluster(service, settings, cluster_name, cluster_data, with_gpt=True
     gpt_label_column = settings.get("gpt_label_column", "gpt_flag")
     gpt_prompt = settings.get(
         "gpt_prompt",
-        "Считай Y, если текст связан с личными финансами, деньгами или расходами пользователя. Иначе N.",
+        "Only Y or N. If bio is fully in English or empty → Y. If it contains any non-English letters → N.",
     )
-    # интервал опроса статуса Bright Data (по умолчанию 1 сек)
     status_poll_sec = int(settings.get("status_poll_sec", "1"))
 
-    # лимит постов на кластер: Settings -> max_posts_per_cluster, потом config
     cluster_limit_raw = settings.get("max_posts_per_cluster", None)
     try:
         cluster_limit = int(cluster_limit_raw) if cluster_limit_raw else BASE_MAX_POSTS_PER_CLUSTER
     except Exception:
         cluster_limit = BASE_MAX_POSTS_PER_CLUSTER
 
-    # Bright Data: лимиты на стороне API
     bright_limit_per_input_raw = settings.get("bright_limit_per_input", "").strip()
     bright_total_limit_raw = settings.get("bright_total_limit", "").strip()
 
@@ -931,12 +899,10 @@ def process_cluster(service, settings, cluster_name, cluster_data, with_gpt=True
         bright_limit_per_input = DEFAULT_NUM_OF_POSTS
 
     try:
-        # общий лимит по умолчанию = лимит на кластер
         bright_total_limit = int(bright_total_limit_raw) if bright_total_limit_raw else cluster_limit
     except Exception:
         bright_total_limit = cluster_limit
 
-    # как часто печатать прогресс GPT (только в консоль)
     gpt_log_every_raw = settings.get("gpt_log_every", "10")
     try:
         gpt_log_every = max(1, int(gpt_log_every_raw))
@@ -966,7 +932,6 @@ def process_cluster(service, settings, cluster_name, cluster_data, with_gpt=True
     max_progress_wait = wait_bright_min * 60
     waited = 0
 
-    # ждём, пока progress станет ready
     last_status_logged = None
     while True:
         status = get_snapshot_status(snapshot_id)
@@ -1002,21 +967,18 @@ def process_cluster(service, settings, cluster_name, cluster_data, with_gpt=True
         time.sleep(poll_sec)
         waited += poll_sec
 
-    # скачиваем снапшот
     posts = download_snapshot(
         snapshot_id,
         max_wait_sec=wait_bright_min * 60,
         poll_sec=poll_sec,
     )
 
-    # 2. Если постов нет — выходим
     if not posts:
         print(f"[{cluster_name}] Постов нет.")
         write_log(service, "no_posts", cluster_name, "0 posts")
         return
 
     original_posts_len = len(posts)
-    # ограничиваем количество постов на кластер уже локально (на всякий случай)
     if cluster_limit > 0 and original_posts_len > cluster_limit:
         posts = posts[:cluster_limit]
     used_posts_len = len(posts)
@@ -1030,7 +992,6 @@ def process_cluster(service, settings, cluster_name, cluster_data, with_gpt=True
     )
     print(f"[{cluster_name}] Snapshot downloaded: original={original_posts_len}, used={used_posts_len}")
 
-    # 3. Формируем batch-метку
     batch_label = (
         datetime.now().strftime("%Y-%m-%d %H:%M")
         + f" | {COMMAND_NAME} | {cluster_name}"
@@ -1043,80 +1004,82 @@ def process_cluster(service, settings, cluster_name, cluster_data, with_gpt=True
     if not header:
         header = HEADER
 
-    old_count = len(old_rows)
+    norm_old_rows = []
+    for r in old_rows:
+        if len(r) < len(header):
+            r = r + [""] * (len(header) - len(r))
+        elif len(r) > len(header):
+            r = r[: len(header)]
+        norm_old_rows.append(r)
 
-    # новые строки
-    new_rows = []
+    rows = list(norm_old_rows)
+    old_count = len(rows)
+
+    # множество уже известных url
+    existing_urls = set()
+    for r in rows:
+        if not r:
+            continue
+        url_val = (r[0] or "").strip()
+        if url_val:
+            existing_urls.add(url_val)
+
+    rows_to_append = []
     for p in posts:
-        followers_val = normalize_followers(p.get("profile_followers", ""))
-        new_rows.append(
-            [
-                p.get("url", ""),
-                p.get("play_count") or p.get("playcount") or "",
-                json.dumps(
-                    p.get("hashtags", []), ensure_ascii=False
-                )
-                if p.get("hashtags")
-                else "",
-                p.get("profile_url", ""),
-                followers_val,
-                p.get("profile_biography", ""),
-                batch_label,
-                "",
-            ]
-        )
+        url_val = (p.get("url", "") or "").strip()
+        if not url_val:
+            continue
+        if url_val in existing_urls:
+            continue
+        existing_urls.add(url_val)
 
-    all_rows = old_rows + new_rows
+        followers_val = normalize_followers(p.get("profile_followers", ""))
+        new_row = [
+            p.get("url", ""),
+            p.get("play_count") or p.get("playcount") or "",
+            json.dumps(
+                p.get("hashtags", []), ensure_ascii=False
+            ) if p.get("hashtags") else "",
+            p.get("profile_url", ""),
+            followers_val,
+            p.get("profile_biography", ""),
+            batch_label,
+            "",
+        ]
+        if len(new_row) < len(header):
+            new_row = new_row + [""] * (len(header) - len(new_row))
+        elif len(new_row) > len(header):
+            new_row = new_row[: len(header)]
+
+        rows.append(new_row)
+        rows_to_append.append(new_row)
+
+    sheet = service.spreadsheets()
+
+    if rows_to_append:
+        sheet.values().append(
+            spreadsheetId=SPREADSHEET_ID,
+            range=f"{SHEET_DATA}!A1",
+            valueInputOption="USER_ENTERED",
+            insertDataOption="INSERT_ROWS",
+            body={"values": rows_to_append},
+        ).execute()
+
     write_log(
         service,
         "rows_appended",
         cluster_name,
-        f"old={old_count} new={len(new_rows)} total={len(all_rows)}",
+        f"old={old_count} new_appended={len(rows_to_append)} total={len(rows)}",
     )
-    print(f"[{cluster_name}] rows_appended: old={old_count}, new={len(new_rows)}, total={len(all_rows)}")
-
-    # 5. Глобальный дедуп по url (во всей таблице)
-    seen = set()
-    deduped = []
-    for r in all_rows:
-        if len(r) < len(header):
-            r += [""] * (len(header) - len(r))
-        url_val = r[0]
-        if not url_val:
-            deduped.append(r)
-            continue
-        if url_val in seen:
-            continue
-        seen.add(url_val)
-        deduped.append(r)
-
-    write_log(
-        service,
-        "dedupe_done",
-        cluster_name,
-        f"before={len(all_rows)} after={len(deduped)}",
-    )
-    print(f"[{cluster_name}] dedupe_done: before={len(all_rows)}, after={len(deduped)}")
-
-    # 5.5. Нормализуем profile_followers (E) во ВСЕХ строках
-    try:
-        followers_idx = header.index("profile_followers")
-    except ValueError:
-        followers_idx = None
-
-    if followers_idx is not None:
-        for r in deduped:
-            if len(r) <= followers_idx:
-                r += [""] * (followers_idx + 1 - len(r))
-            r[followers_idx] = normalize_followers(r[followers_idx])
+    print(f"[{cluster_name}] rows_appended: old={old_count}, new={len(rows_to_append)}, total={len(rows)}")
 
     # 6. GPT-разметка (опционально)
     if with_gpt:
-        deduped, gpt_count = apply_gpt_labels(
+        rows, gpt_count = apply_gpt_labels(
             service,
             cluster_name,
             header,
-            deduped,
+            rows,
             gpt_target_column,
             gpt_label_column,
             gpt_prompt,
@@ -1125,11 +1088,8 @@ def process_cluster(service, settings, cluster_name, cluster_data, with_gpt=True
         write_log(service, "gpt_done", cluster_name, f"processed={gpt_count}")
         print(f"[{cluster_name}] GPT done, processed={gpt_count}")
 
-    # 7. Сохраняем в Google Sheets (после дедупа — логично перезаписать A:H)
-    save_data_sheet(service, header, deduped)
-    total_rows = len(deduped) + 1  # + хедер
+    total_rows = len(rows) + 1  # + заголовок
 
-    # 8. Протягиваем формулы H–J и форматируем колонку E как числа
     extend_formulas_hij(service, total_rows)
     format_column_e_numbers(service, total_rows)
 
@@ -1137,12 +1097,12 @@ def process_cluster(service, settings, cluster_name, cluster_data, with_gpt=True
         service,
         "cluster_done",
         cluster_name,
-        f"rows_total={len(deduped)}",
+        f"rows_total={len(rows)}",
     )
-    print(f"[{cluster_name}] cluster_done, rows_total={len(deduped)}")
+    print(f"[{cluster_name}] cluster_done, rows_total={len(rows)}")
 
 
-# ---------- GPT по основной таблице ----------
+# ---------- прогон по активным кластерам ----------
 
 def _run_over_active_clusters(service, settings, with_gpt=True, run_label="run"):
     clusters = load_clusters(service)
@@ -1158,7 +1118,6 @@ def _run_over_active_clusters(service, settings, with_gpt=True, run_label="run")
         write_log(service, "no_active_clusters", "", run_label)
         return
 
-    # сортируем по order и проходим ВСЕ активные кластеры с 1 до последнего
     active_clusters.sort(key=lambda x: x[1]["order"])
     cluster_names = [name for name, _ in active_clusters]
 
@@ -1175,7 +1134,6 @@ def _run_over_active_clusters(service, settings, with_gpt=True, run_label="run")
     for cluster_name, cluster_data in active_clusters:
         try:
             process_cluster(service, settings, cluster_name, cluster_data, with_gpt=with_gpt)
-            # purely информативно — можно смотреть в Settings
             update_setting(service, "last_cluster_name", cluster_name)
         except Exception as e:
             print(
@@ -1190,7 +1148,6 @@ def _run_over_active_clusters(service, settings, with_gpt=True, run_label="run")
                 cluster_name,
                 repr(e),
             )
-            # идём дальше к следующему кластеру, но твёрдо логируем проблему
 
     write_log(
         service,
@@ -1223,9 +1180,13 @@ def run_scrape_only():
 
 def run_gpt_only(overwrite=False):
     """
-    Режим: только GPT.
-    Берёт ВСЕ строки из TikTok_Posts и размечает колонку gpt_flag.
-    Если overwrite=True — сначала очищает колонку gpt_flag и размечает заново.
+    Режим: только GPT по TikTok_Posts.
+    - Идём СВЕРХУ ВНИЗ по всем строкам;
+    - меняем только пустые gpt_flag (не перезатираем уже заполненные);
+    - что вернул GPT — то и пишем в ячейку;
+    - прогресс сохраняется после каждой строки.
+
+    Если overwrite=True — сначала очищаем колонку gpt_flag и размечаем заново.
     """
     service = get_sheets_service()
     settings = load_settings(service)
@@ -1234,7 +1195,7 @@ def run_gpt_only(overwrite=False):
     gpt_label_column = settings.get("gpt_label_column", "gpt_flag")
     gpt_prompt = settings.get(
         "gpt_prompt",
-        "Считай Y, если текст связан с личными финансами, деньгами или расходами пользователя. Иначе N.",
+        "Only Y or N. If bio is fully in English or empty → Y. If it contains any non-English letters → N.",
     )
 
     header, rows = load_data_sheet(service)
@@ -1245,7 +1206,6 @@ def run_gpt_only(overwrite=False):
     print(f"[GPT_ONLY] Всего строк в TikTok_Posts: {len(rows)}")
     print(f"[GPT_ONLY] Целевая колонка: {gpt_target_column}, колонка флага: {gpt_label_column}")
 
-    # по желанию можно снести старые флаги
     if overwrite:
         try:
             label_idx = header.index(gpt_label_column)
@@ -1253,9 +1213,9 @@ def run_gpt_only(overwrite=False):
                 if len(r) <= label_idx:
                     rows[i] = r + [""] * (label_idx + 1 - len(r))
                 rows[i][label_idx] = ""
-            print("[GPT_ONLY] Все gpt_flag очищены, размечаем с нуля.")
+            print("[GPT_ONLY] Все значения в колонке флага очищены, размечаем с нуля.")
         except ValueError:
-            print("[GPT_ONLY] Колонка gpt_flag не найдена, пропускаем очистку.")
+            print("[GPT_ONLY] Колонка флага не найдена, пропускаем очистку.")
 
     rows, processed = apply_gpt_labels(
         service,
@@ -1268,7 +1228,6 @@ def run_gpt_only(overwrite=False):
         log_every=10,
     )
 
-    # финальный сброс: ещё раз сохраняем только колонку с метками
     save_gpt_labels_only(service, header, rows, gpt_label_column)
     print(f"[GPT_ONLY] Готово. GPT обработал строк: {processed}")
 
@@ -1283,30 +1242,32 @@ def run_us_based():
     B: URL
     C: BIO
     D: Subscribers
-    E: US_flag (Y/N)
-    F: US_category (1..5)
-    G: Verdict (формула, которую надо протягивать)
+    E: US_flag
+    F: US_category
+    G: Verdict (формула)
 
-    GPT продолжает работу с первой строки после последней строки,
-    где и E, и F уже заполнены (не пустые).
+    ЛОГИКА:
+    - Всегда идём СВЕРХУ ВНИЗ по всем строкам.
+    - Если и E, и F уже заполнены — строку НЕ трогаем.
+    - Если что-то пусто — шлём BIO в GPT и пишем РОВНО то,
+      что вернула модель (без авто-правок в Python).
+    - Прогресс по E/F сохраняем каждые ~10 строк и в конце.
     """
     service = get_sheets_service()
     settings = load_settings(service)
     sheet = service.spreadsheets()
 
-    # Промпт для US_flag (Y/N)
     default_us_flag_prompt = (
-        "Return 'N' if text clearly indicates that the creator is not from the US "
-        "(for example: UK, India, Philippines, Canada, Europe, Africa, Asia, etc). "
-        "In all other cases, including when the country is not mentioned or not obvious, return 'Y'. "
-        "Answer with a single letter: Y or N."
+        "You are a classifier for TikTok bios. "
+        "Return exactly one letter: Y or N.\n"
+        "If it is clear that the creator is NOT from the US "
+        "(e.g. UK, India, Philippines, Canada, Europe, Africa, Asia, etc.) -> N.\n"
+        "In all other cases (including when the country is not obvious) -> Y."
     )
     us_flag_prompt = settings.get("us_based_gpt_prompt", default_us_flag_prompt)
 
-    # Промпт для категорий 1–5
     default_categories_prompt = (
-        "Analyze the text (TikTok bio) and assign exactly one label from the list below. "
-        "Output only the label number (1, 2, 3, 4, or 5).\n"
+        "Analyze the TikTok bio and output EXACTLY one label number (1, 2, 3, 4, or 5).\n"
         "1 - Individual creator related to finance, AI, or personal productivity.\n"
         "2 - Individual creator NOT related to finance, AI, or personal productivity.\n"
         "3 - Unknown (not enough information to tell).\n"
@@ -1315,7 +1276,6 @@ def run_us_based():
     )
     categories_prompt = settings.get("us_based_categories_prompt", default_categories_prompt)
 
-    # Берём B1:G — 6 колонок: URL, BIO, Subscribers, US_flag, US_category, Verdict
     resp = sheet.values().get(
         spreadsheetId=SPREADSHEET_ID,
         range=f"{SHEET_US_BASED}!B1:G",
@@ -1330,19 +1290,16 @@ def run_us_based():
     header = values[0]
     rows = values[1:]
 
-    # гарантируем минимум 6 колонок в шапке
     header_updated = False
     if len(header) < 6:
         header = header + [""] * (6 - len(header))
         header_updated = True
 
-    # индексы относительно B:
     BIO_COL = 1       # C
     US_FLAG_COL = 3   # E
     US_CAT_COL = 4    # F
     VERDICT_COL = 5   # G
 
-    # гарантируем имена колонок E/F
     if not str(header[US_FLAG_COL]).strip():
         header[US_FLAG_COL] = "US_flag"
         header_updated = True
@@ -1358,52 +1315,36 @@ def run_us_based():
             body={"values": [header]},
         ).execute()
 
-    # выравниваем строки до длины шапки
     max_cols = len(header)
     for i, r in enumerate(rows):
         if len(r) < max_cols:
             rows[i] = r + [""] * (max_cols - len(r))
+        elif len(r) > max_cols:
+            rows[i] = r[: max_cols]
 
-    # находим последнюю непустую строку в Verdict (G)
-    last_verdict_row = None  # 1-based номер строки листа
+    # последняя строка, где есть формула/значение в Verdict (G)
+    last_verdict_row = None
     for idx, r in enumerate(rows, start=2):  # строки 2..N
         if len(r) > VERDICT_COL and str(r[VERDICT_COL]).strip():
             last_verdict_row = idx
 
-    # Ищем последнюю строку, где и E, и F не пустые
-    start_index = 0  # индекс в массиве rows (0 = строка 2 в листе)
-    if rows:
-        last_full_labeled = None
-        for idx in range(len(rows) - 1, -1, -1):
-            flag_val = (rows[idx][US_FLAG_COL] or "").strip()
-            cat_val = (rows[idx][US_CAT_COL] or "").strip()
-            if flag_val and cat_val:
-                last_full_labeled = idx
-                break
-        if last_full_labeled is not None:
-            start_index = last_full_labeled + 1  # начинаем с следующей строки
-
-    # считаем, сколько нужно обработать, начиная с start_index
     total_to_process = 0
-    for r in rows[start_index:]:
-        flag_val = (r[US_FLAG_COL] or "").strip().upper()
-        cat_val = str(r[US_CAT_COL]).strip() if r[US_CAT_COL] is not None else ""
-        if flag_val not in ("Y", "N") or cat_val not in ("1", "2", "3", "4", "5"):
+    for r in rows:
+        flag_val = (r[US_FLAG_COL] or "").strip()
+        cat_val = (r[US_CAT_COL] or "").strip()
+        if not flag_val or not cat_val:
             total_to_process += 1
 
-    print(
-        f"[US_BASED] Всего строк: {len(rows)}, "
-        f"стартуем с строки листа {start_index + 2}, к обработке: {total_to_process}"
-    )
+    print(f"[US_BASED] Всего строк: {len(rows)}, к обработке: {total_to_process}")
     write_log(
         service,
         "us_based_start",
         SHEET_US_BASED,
-        f"rows={len(rows)} to_process={total_to_process} start_row={start_index + 2}",
+        f"rows={len(rows)} to_process={total_to_process}",
     )
 
     if total_to_process == 0:
-        print("[US_BASED] Все строки после стартовой уже размечены по US_flag и US_category.")
+        print("[US_BASED] Все строки уже размечены по US_flag и US_category.")
         if last_verdict_row:
             extend_us_based_verdict_formulas(
                 service,
@@ -1415,40 +1356,28 @@ def run_us_based():
 
     processed = 0
 
-    for row_idx in range(start_index, len(rows)):
-        r = rows[row_idx]
+    for row_idx, r in enumerate(rows):
+        flag_val = (r[US_FLAG_COL] or "").strip()
+        cat_val = (r[US_CAT_COL] or "").strip()
 
-        flag_val = (r[US_FLAG_COL] or "").strip().upper()
-        cat_val = str(r[US_CAT_COL]).strip() if r[US_CAT_COL] is not None else ""
-
-        need_flag = flag_val not in ("Y", "N")
-        need_cat = cat_val not in ("1", "2", "3", "4", "5")
+        need_flag = not flag_val
+        need_cat = not cat_val
 
         if not (need_flag or need_cat):
             continue
 
         bio = ""
         if BIO_COL < len(r) and r[BIO_COL] is not None:
-            bio = str(r[BIO_COL]).strip()
+            bio = str(r[BIO_COL])
 
-        if not bio:
-            # пустое BIO: страна не указана, тип неизвестен
-            if need_flag:
-                r[US_FLAG_COL] = "Y"
-            if need_cat:
-                r[US_CAT_COL] = "3"
-        else:
-            if need_flag:
-                yn = call_gpt_label(us_flag_prompt, bio)
-                # здесь всё равно ожидаем Y/N от GPT,
-                # но НИКАК не трогаем ответ, кроме проверки на мусор
-                if yn not in ("Y", "N"):
-                    yn = ""
+        if need_flag:
+            yn = call_gpt_label(us_flag_prompt, bio)
+            if yn != "":
                 r[US_FLAG_COL] = yn
-            if need_cat:
-                cat = call_gpt_category_5(categories_prompt, bio)
-                if cat not in ("1", "2", "3", "4", "5"):
-                    cat = "3"
+
+        if need_cat:
+            cat = call_gpt_category_5(categories_prompt, bio)
+            if cat != "":
                 r[US_CAT_COL] = cat
 
         processed += 1
@@ -1463,7 +1392,6 @@ def run_us_based():
                 body={"values": ef_values},
             ).execute()
 
-    # финальный сброс E/F
     ef_values = [[r[US_FLAG_COL], r[US_CAT_COL]] for r in rows]
     sheet.values().update(
         spreadsheetId=SPREADSHEET_ID,
@@ -1472,7 +1400,6 @@ def run_us_based():
         body={"values": ef_values},
     ).execute()
 
-    # протягиваем Verdict (G) от последней непустой строки до конца данных
     if last_verdict_row:
         extend_us_based_verdict_formulas(
             service,
@@ -1503,7 +1430,7 @@ if __name__ == "__main__":
         # только выгрузка Bright Data + запись в таблицу
         run_scrape_only()
     elif mode == "start":
-        # режим для вкладки US_Based (двойной GPT + протяжка Verdict)
+        # режим для вкладки US_Based (GPT по E/F + протяжка Verdict)
         run_us_based()
     else:
         # полный цикл: Bright Data + GPT по кластерам
