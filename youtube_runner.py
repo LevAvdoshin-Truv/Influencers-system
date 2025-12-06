@@ -753,91 +753,6 @@ def process_cluster(service, settings, cluster_name, cluster_data, with_gpt=True
         f"items={len(items)} | platform=YouTube | mode={mode}",
     )
 
-    result = start_scrape_inputs(
-        items,
-        mode,
-        limit_per_input=bright_limit_per_input,
-        total_limit=bright_total_limit,
-    )
-    snapshot_id = result["snapshot_id"]
-    write_log(
-        service,
-        "bright_async_started",
-        cluster_name,
-        f"snapshot_id={snapshot_id}",
-    )
-    print("ASYNC, snapshot_id =", snapshot_id)
-
-    poll_sec = status_poll_sec
-    max_progress_wait = wait_bright_min * 60
-    waited = 0
-
-    last_status_logged = None
-    while True:
-        status = get_snapshot_status(snapshot_id)
-        if status != last_status_logged:
-            write_log(service, "snapshot_status", cluster_name, status)
-            last_status_logged = status
-        print(f"Статус снапшота: {status}, waited={waited} sec")
-
-        if status == "ready":
-            break
-        if status in ("failed", "error", "canceled", "canceling"):
-            print(
-                f"Снапшот завершился с ошибочным статусом ({status}). Пропускаем кластер."
-            )
-            write_log(
-                service,
-                "snapshot_failed",
-                cluster_name,
-                f"status={status} waited={waited}",
-            )
-            return
-
-        if waited >= max_progress_wait:
-            print("Таймаут ожидания статуса ready. Пропускаем кластер.")
-            write_log(
-                service,
-                "snapshot_timeout_status",
-                cluster_name,
-                f"waited={waited}",
-            )
-            return
-
-        time.sleep(poll_sec)
-        waited += poll_sec
-
-    posts = download_snapshot(
-        snapshot_id,
-        max_wait_sec=wait_bright_min * 60,
-        poll_sec=poll_sec,
-    )
-
-    if not posts:
-        print(f"[{cluster_name}] Постов нет.")
-        write_log(service, "no_posts", cluster_name, "0 posts")
-        return
-
-    original_posts_len = len(posts)
-    if cluster_limit > 0 and original_posts_len > cluster_limit:
-        posts = posts[:cluster_limit]
-    used_posts_len = len(posts)
-
-    write_log(
-        service,
-        "snapshot_downloaded",
-        cluster_name,
-        f"posts_original={original_posts_len} posts_used={used_posts_len} "
-        f"cluster_limit={cluster_limit} bright_total_limit={bright_total_limit}",
-    )
-    print(f"[{cluster_name}] Snapshot downloaded: original={original_posts_len}, used={used_posts_len}")
-
-    batch_label = (
-        datetime.now().strftime("%Y-%m-%d %H:%M")
-        + f" | {COMMAND_NAME} | {cluster_name}"
-    )
-    print("batch_label:", batch_label)
-
     ensure_data_header(service)
     header, old_rows = load_data_sheet(service)
     if not header:
@@ -862,78 +777,188 @@ def process_cluster(service, settings, cluster_name, cluster_data, with_gpt=True
         if url_val:
             existing_urls.add(url_val)
 
-    skipped_no_url = 0
-    skipped_duplicate = 0
-
-    rows_to_append = []
-    for p in posts:
-        url_val = extract_video_url(p)
-        if not url_val:
-            skipped_no_url += 1
-            continue
-        if url_val in existing_urls:
-            skipped_duplicate += 1
-            continue
-        existing_urls.add(url_val)
-
-        followers_val = normalize_followers(
-            p.get("subscribers") or ""
-        )
-
-        hashtags_val = ""
-        if p.get("tags"):
-            try:
-                hashtags_val = json.dumps(p.get("tags"), ensure_ascii=False)
-            except Exception:
-                hashtags_val = ""
-
-        new_row = [
-            url_val,
-            p.get("views") or "",
-            hashtags_val,
-            p.get("channel_url") or "",
-            followers_val,
-            p.get("description") or "",
-            batch_label,
-            "",
-        ]
-        if len(new_row) < len(header):
-            new_row = new_row + [""] * (len(header) - len(new_row))
-        elif len(new_row) > len(header):
-            new_row = new_row[: len(header)]
-
-        rows.append(new_row)
-        rows_to_append.append(new_row)
+    remaining_cluster = cluster_limit if cluster_limit > 0 else None
+    total_appended = 0
 
     sheet = service.spreadsheets()
 
-    if rows_to_append:
-        sheet.values().append(
-            spreadsheetId=SPREADSHEET_ID,
-            range=f"{SHEET_DATA}!A1",
-            valueInputOption="USER_ENTERED",
-            insertDataOption="INSERT_ROWS",
-            body={"values": rows_to_append},
-        ).execute()
+    for item_idx, item in enumerate(items, start=1):
+        # пер-Input лог
+        write_log(
+            service,
+            "start_input",
+            cluster_name,
+            f"item_idx={item_idx}/{len(items)} mode={mode} value={item[:80]}",
+        )
+        print(f"[{cluster_name}] Start input {item_idx}/{len(items)}: {item}")
 
-    write_log(
-        service,
-        "rows_appended",
-        cluster_name,
-        (
-            f"old={old_count} new_appended={len(rows_to_append)} "
-            f"total={len(rows)} skipped_no_url={skipped_no_url} "
-            f"skipped_duplicate={skipped_duplicate}"
-        ),
-    )
-    print(
-        f"[{cluster_name}] rows_appended: old={old_count}, "
-        f"new={len(rows_to_append)}, total={len(rows)}, "
-        f"skipped_no_url={skipped_no_url}, "
-        f"skipped_duplicate={skipped_duplicate}"
-    )
+        per_input_limit = bright_limit_per_input
+        if remaining_cluster is not None:
+            per_input_limit = min(per_input_limit, remaining_cluster)
+            if per_input_limit <= 0:
+                print(f"[{cluster_name}] Достигнут cluster_limit, пропускаем оставшиеся inputs")
+                break
 
-    if with_gpt:
+        result = start_scrape_inputs(
+            [item],
+            mode,
+            limit_per_input=per_input_limit,
+            total_limit=per_input_limit if per_input_limit else bright_total_limit,
+        )
+        snapshot_id = result["snapshot_id"]
+        write_log(
+            service,
+            "bright_async_started",
+            cluster_name,
+            f"snapshot_id={snapshot_id} item_idx={item_idx}",
+        )
+        print("ASYNC, snapshot_id =", snapshot_id)
+
+        poll_sec = status_poll_sec
+        max_progress_wait = wait_bright_min * 60
+        waited = 0
+
+        last_status_logged = None
+        while True:
+            status = get_snapshot_status(snapshot_id)
+            if status != last_status_logged:
+                write_log(service, "snapshot_status", cluster_name, f"{status} item_idx={item_idx}")
+                last_status_logged = status
+            print(f"Статус снапшота: {status}, waited={waited} sec")
+
+            if status == "ready":
+                break
+            if status in ("failed", "error", "canceled", "canceling"):
+                print(
+                    f"Снапшот завершился с ошибочным статусом ({status}). Пропускаем input."
+                )
+                write_log(
+                    service,
+                    "snapshot_failed",
+                    cluster_name,
+                    f"status={status} waited={waited} item_idx={item_idx}",
+                )
+                break
+
+            if waited >= max_progress_wait:
+                print("Таймаут ожидания статуса ready. Пропускаем input.")
+                write_log(
+                    service,
+                    "snapshot_timeout_status",
+                    cluster_name,
+                    f"waited={waited} item_idx={item_idx}",
+                )
+                break
+
+            time.sleep(poll_sec)
+            waited += poll_sec
+
+        posts = download_snapshot(
+            snapshot_id,
+            max_wait_sec=wait_bright_min * 60,
+            poll_sec=poll_sec,
+        )
+
+        if not posts:
+            print(f"[{cluster_name}] Постов нет для input {item_idx}.")
+            write_log(service, "no_posts", cluster_name, f"item_idx={item_idx} 0 posts")
+            continue
+
+        if remaining_cluster is not None and remaining_cluster > 0 and len(posts) > remaining_cluster:
+            posts = posts[:remaining_cluster]
+
+        used_posts_len = len(posts)
+
+        write_log(
+            service,
+            "snapshot_downloaded",
+            cluster_name,
+            f"item_idx={item_idx} posts_used={used_posts_len} per_input_limit={per_input_limit} cluster_limit={cluster_limit}",
+        )
+        print(f"[{cluster_name}] Snapshot downloaded: used={used_posts_len} for input {item_idx}")
+
+        batch_label = (
+            datetime.now().strftime("%Y-%m-%d %H:%M")
+            + f" | {COMMAND_NAME} | {cluster_name}"
+        )
+
+        skipped_no_url = 0
+        skipped_duplicate = 0
+        rows_to_append = []
+
+        for p in posts:
+            url_val = extract_video_url(p)
+            if not url_val:
+                skipped_no_url += 1
+                continue
+            if url_val in existing_urls:
+                skipped_duplicate += 1
+                continue
+            existing_urls.add(url_val)
+
+            followers_val = normalize_followers(
+                p.get("subscribers") or ""
+            )
+
+            hashtags_val = ""
+            if p.get("tags"):
+                try:
+                    hashtags_val = json.dumps(p.get("tags"), ensure_ascii=False)
+                except Exception:
+                    hashtags_val = ""
+
+            new_row = [
+                url_val,
+                p.get("views") or "",
+                hashtags_val,
+                p.get("channel_url") or "",
+                followers_val,
+                p.get("description") or "",
+                batch_label,
+                "",
+            ]
+            if len(new_row) < len(header):
+                new_row = new_row + [""] * (len(header) - len(new_row))
+            elif len(new_row) > len(header):
+                new_row = new_row[: len(header)]
+
+            rows.append(new_row)
+            rows_to_append.append(new_row)
+
+        if rows_to_append:
+            sheet.values().append(
+                spreadsheetId=SPREADSHEET_ID,
+                range=f"{SHEET_DATA}!A1",
+                valueInputOption="USER_ENTERED",
+                insertDataOption="INSERT_ROWS",
+                body={"values": rows_to_append},
+            ).execute()
+
+        total_appended += len(rows_to_append)
+        if remaining_cluster is not None:
+            remaining_cluster = max(0, remaining_cluster - len(rows_to_append))
+
+        write_log(
+            service,
+            "rows_appended",
+            cluster_name,
+            (
+                f"item_idx={item_idx} new_appended={len(rows_to_append)} "
+                f"skipped_no_url={skipped_no_url} skipped_duplicate={skipped_duplicate} "
+                f"remaining_cluster={remaining_cluster if remaining_cluster is not None else 'inf'}"
+            ),
+        )
+        print(
+            f"[{cluster_name}] rows_appended: new={len(rows_to_append)}, "
+            f"total_rows={len(rows)}, skipped_no_url={skipped_no_url}, "
+            f"skipped_duplicate={skipped_duplicate}, remaining_cluster={remaining_cluster}"
+        )
+
+        if remaining_cluster is not None and remaining_cluster <= 0:
+            print(f"[{cluster_name}] cluster_limit достигнут, выходим из кластера.")
+            break
+
+    if with_gpt and rows:
         rows, gpt_count = apply_gpt_labels(
             service,
             cluster_name,
@@ -956,9 +981,9 @@ def process_cluster(service, settings, cluster_name, cluster_data, with_gpt=True
         service,
         "cluster_done",
         cluster_name,
-        f"rows_total={len(rows)}",
+        f"rows_total={len(rows)} appended={total_appended}",
     )
-    print(f"[{cluster_name}] cluster_done, rows_total={len(rows)}")
+    print(f"[{cluster_name}] cluster_done, rows_total={len(rows)}, appended={total_appended}")
 
 
 # ---------- прогон по активным кластерам ----------
