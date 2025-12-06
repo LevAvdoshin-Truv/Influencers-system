@@ -21,6 +21,7 @@ def _int_from_config(key, default):
 
 BRIGHTDATA_API_KEY = CONFIG["BRIGHTDATA_API_KEY"]
 YOUTUBE_DATASET_ID = CONFIG["YOUTUBE_DATASET_ID"]
+YOUTUBE_COLLECT_DATASET_ID = CONFIG.get("YOUTUBE_COLLECT_DATASET_ID") or YOUTUBE_DATASET_ID
 DEFAULT_NUM_OF_POSTS = _int_from_config("YOUTUBE_DEFAULT_NUM_OF_POSTS", 50)
 BASE_MAX_POSTS_PER_CLUSTER = _int_from_config("YOUTUBE_MAX_POSTS_PER_CLUSTER", 1000)
 
@@ -202,8 +203,11 @@ def update_setting(service, key, new_value):
 
 def load_youtube_clusters(service):
     """
-    Читает лист Clusters и возвращает только активные строки с platform=YouTube.
-    Формат строк: cluster_name | active | order | keyword | platform
+    Читает лист Clusters и возвращает активные строки с platform=YouTube*.
+    Формат строк: cluster_name | active | order | value | platform
+    platform:
+        youtube / youtube_collect  — сбор по URL (dataset_id=YOUTUBE_COLLECT_DATASET_ID)
+        youtube_discover / youtube_keyword — сбор по keyword (dataset_id=YOUTUBE_DATASET_ID)
     """
     sheet = service.spreadsheets()
     resp = sheet.values().get(
@@ -223,20 +227,24 @@ def load_youtube_clusters(service):
         if not name:
             continue
         platform = (row[4] if len(row) >= 5 else "").strip().lower()
-        if platform and platform != "youtube":
+        if platform and not platform.startswith("youtube"):
             continue
         active_flag = (row[1] or "").strip().upper() == "Y"
         try:
             order = int(row[2])
         except Exception:
             continue
-        keyword = (row[3] or "").strip()
-        if not keyword:
+        value = (row[3] or "").strip()
+        if not value:
             continue
 
+        mode = "collect"
+        if platform in ("youtube_discover", "youtube_keyword"):
+            mode = "keyword"
+
         if name not in clusters:
-            clusters[name] = {"order": order, "active": active_flag, "keywords": []}
-        clusters[name]["keywords"].append(keyword)
+            clusters[name] = {"order": order, "active": active_flag, "items": [], "mode": mode}
+        clusters[name]["items"].append(value)
         if active_flag:
             clusters[name]["active"] = True
 
@@ -499,15 +507,20 @@ def apply_gpt_labels(
 
 # ---------- Bright Data ----------
 
-def start_scrape_for_keywords(keywords, limit_per_input=None, total_limit=None):
+def start_scrape_inputs(items, mode, limit_per_input=None, total_limit=None):
     """
-    Запускает асинхронный сбор в Bright Data по списку ключевых слов.
+    Запускает асинхронный сбор в Bright Data.
+    mode:
+        keyword — discover by keyword
+        collect — collect by URL
     Возвращает snapshot_id.
     """
     base_url = "https://api.brightdata.com/datasets/v3/trigger"
 
+    dataset_id = YOUTUBE_DATASET_ID if mode == "keyword" else YOUTUBE_COLLECT_DATASET_ID
+
     params = {
-        "dataset_id": YOUTUBE_DATASET_ID,
+        "dataset_id": dataset_id,
         "include_errors": "true",
         "format": "json",
     }
@@ -530,13 +543,11 @@ def start_scrape_for_keywords(keywords, limit_per_input=None, total_limit=None):
     }
 
     inputs = []
-    for kw in keywords:
-        inputs.append(
-            {
-                "keyword": kw,
-                # дополнительные параметры могут прийти из Settings
-            }
-        )
+    for it in items:
+        if mode == "keyword":
+            inputs.append({"keyword": it})
+        else:
+            inputs.append({"url": it})
 
     resp = requests.post(
         base_url,
@@ -691,7 +702,8 @@ def format_column_e_numbers(service, last_row):
 # ---------- обработка одного кластера ----------
 
 def process_cluster(service, settings, cluster_name, cluster_data, with_gpt=True):
-    keywords = cluster_data["keywords"]
+    items = cluster_data["items"]
+    mode = cluster_data.get("mode", "collect")
 
     wait_bright_min = int(settings.get("wait_bright_min", "20"))
     gpt_target_column = settings.get("gpt_target_column", "profile_biography")
@@ -728,16 +740,17 @@ def process_cluster(service, settings, cluster_name, cluster_data, with_gpt=True
         gpt_log_every = 10
 
     print("\n================ Новый кластер (YouTube) ================")
-    print("Кластер:", cluster_name, "ключевых слов:", len(keywords))
+    print("Кластер:", cluster_name, "записей:", len(items), "mode:", mode)
     write_log(
         service,
         "start_cluster",
         cluster_name,
-        f"keywords={len(keywords)} | platform=YouTube | dataset_id={YOUTUBE_DATASET_ID}",
+        f"items={len(items)} | platform=YouTube | mode={mode}",
     )
 
-    result = start_scrape_for_keywords(
-        keywords,
+    result = start_scrape_inputs(
+        items,
+        mode,
         limit_per_input=bright_limit_per_input,
         total_limit=bright_total_limit,
     )
