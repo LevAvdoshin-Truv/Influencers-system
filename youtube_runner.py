@@ -525,6 +525,11 @@ def start_scrape_inputs(items, mode, limit_per_input=None, total_limit=None):
         "format": "json",
     }
 
+    # для discover by keyword Bright Data требует type=discover_new & discover_by=keyword
+    if mode == "keyword":
+        params["type"] = "discover_new"
+        params["discover_by"] = "keyword"
+
     if limit_per_input is not None:
         try:
             params["limit_per_input"] = int(limit_per_input)
