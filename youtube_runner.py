@@ -507,7 +507,7 @@ def apply_gpt_labels(
 
 # ---------- Bright Data ----------
 
-def start_scrape_inputs(items, mode, limit_per_input=None, total_limit=None):
+def start_scrape_inputs(items, mode, limit_per_input=None, total_limit=None, country=None):
     """
     Запускает асинхронный сбор в Bright Data.
     mode:
@@ -550,9 +550,9 @@ def start_scrape_inputs(items, mode, limit_per_input=None, total_limit=None):
     inputs = []
     for it in items:
         if mode == "keyword":
-            inputs.append({"keyword": it})
+            inputs.append({"keyword": it, "country": country or ""})
         else:
-            inputs.append({"url": it})
+            inputs.append({"url": it, "country": country or ""})
 
     resp = requests.post(
         base_url,
@@ -711,6 +711,7 @@ def process_cluster(service, settings, cluster_name, cluster_data, with_gpt=True
     mode = cluster_data.get("mode", "collect")
 
     wait_bright_min = int(settings.get("wait_bright_min", "20"))
+    youtube_country = settings.get("youtube_country", "US").strip()
     gpt_target_column = settings.get("gpt_target_column", "profile_biography")
     gpt_label_column = settings.get("gpt_label_column", "gpt_flag")
     gpt_prompt = settings.get(
@@ -804,6 +805,7 @@ def process_cluster(service, settings, cluster_name, cluster_data, with_gpt=True
             mode,
             limit_per_input=per_input_limit,
             total_limit=per_input_limit if per_input_limit else bright_total_limit,
+            country=youtube_country,
         )
         snapshot_id = result["snapshot_id"]
         write_log(
