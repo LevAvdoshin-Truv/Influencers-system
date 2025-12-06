@@ -104,25 +104,26 @@ https://docs.google.com/document/d/17AhEgIkJ-3MSd7Gb_J8ijSDB7lNVeDlpY1lwi5-QE2E/
 cd ~/tiktok-bot
 source ~/venv/bin/activate
 python3 tiktok_runner.py
+```
 
 ---
 
-## Команды запуска (TikTok + Instagram)
+## Команды запуска (TikTok + YouTube)
 
 Все пути от `/home/lev_avdoshin/tiktok-bot`. Platform в листе `Clusters` определяет, кто заберёт строки.
 
 TikTok:
-- Полный цикл (Bright Data + GPT): `source ~/venv/bin/activate && cd ~/tiktok-bot && python3 tiktok_runner.py`
-- Только GPT по `TikTok_Posts`: `source ~/venv/bin/activate && cd ~/tiktok-bot && python3 tiktok_runner.py gpt_only`
-- US_Based (лист `US_Based`): `source ~/venv/bin/activate && cd ~/tiktok-bot && python3 tiktok_runner.py start`
-- Только скрейп без GPT: `source ~/venv/bin/activate && cd ~/tiktok-bot && python3 tiktok_runner.py scrape_only`
+- Полный цикл (Bright Data + GPT): source ~/venv/bin/activate && cd ~/tiktok-bot && python3 tiktok_runner.py
+- Только GPT по `TikTok_Posts`: source ~/venv/bin/activate && cd ~/tiktok-bot && python3 tiktok_runner.py gpt_only
+- US_Based (лист `US_Based`): source ~/venv/bin/activate && cd ~/tiktok-bot && python3 tiktok_runner.py start
+- Только скрейп без GPT: source ~/venv/bin/activate && cd ~/tiktok-bot && python3 tiktok_runner.py scrape_only
 
-Instagram:
-- Полный цикл (Bright Data + GPT): `source ~/venv/bin/activate && cd ~/tiktok-bot && python3 instagram_runner.py`
-- Только скрейп без GPT: `source ~/venv/bin/activate && cd ~/tiktok-bot && python3 instagram_runner.py scrape_only`
-- Только GPT по существующим строкам: `source ~/venv/bin/activate && cd ~/tiktok-bot && python3 instagram_runner.py gpt_only`
+YouTube (dataset discover/collect по платформе в Clusters):
+- Полный цикл (Bright Data + GPT): source ~/venv/bin/activate && cd ~/tiktok-bot && python3 youtube_runner.py
+- Только скрейп без GPT: source ~/venv/bin/activate && cd ~/tiktok-bot && python3 youtube_runner.py scrape_only
+- Только GPT по существующим строкам: source ~/venv/bin/activate && cd ~/tiktok-bot && python3 youtube_runner.py gpt_only
 
 Обновление кода с GitHub:
-- `cd ~/tiktok-bot && git pull`
-- `grep -n "bot_status" tiktok_runner.py`
-- `grep -n "run_once" tiktok_runner.py`
+- cd ~/tiktok-bot && git pull
+- grep -n bot_status tiktok_runner.py
+- grep -n run_once tiktok_runner.py
