@@ -1019,7 +1019,8 @@ def _run_over_active_clusters(service, settings, with_gpt=True, run_label="run_y
 
     for cluster_name, cluster_data in active_clusters:
         try:
-            process_cluster(service, settings, cluster_name, cluster_data, with_gpt=with_gpt)
+            # GPT выполняем позже, одним проходом, поэтому здесь with_gpt=False
+            process_cluster(service, settings, cluster_name, cluster_data, with_gpt=False)
             update_setting(service, "last_cluster_name_youtube", cluster_name)
         except Exception as e:
             print(
@@ -1034,6 +1035,9 @@ def _run_over_active_clusters(service, settings, with_gpt=True, run_label="run_y
                 cluster_name,
                 repr(e),
             )
+
+    if with_gpt:
+        _run_gpt_for_sheet(service, settings, overwrite=False, log_label="RUN_YOUTUBE_ALL")
 
     write_log(
         service,
@@ -1066,6 +1070,10 @@ def run_gpt_only(overwrite=False):
     service = get_sheets_service()
     settings = load_settings(service)
 
+    _run_gpt_for_sheet(service, settings, overwrite=overwrite, log_label="GPT_ONLY_YOUTUBE")
+
+
+def _run_gpt_for_sheet(service, settings, overwrite=False, log_label="RUN_YOUTUBE_ALL"):
     gpt_target_column = settings.get("gpt_target_column", "profile_biography")
     gpt_label_column = settings.get("gpt_label_column", "gpt_flag")
     gpt_prompt = settings.get(
@@ -1075,11 +1083,11 @@ def run_gpt_only(overwrite=False):
 
     header, rows = load_data_sheet(service)
     if not header or not rows:
-        print("[GPT_ONLY] Лист TikTok_Posts пуст или без заголовка.")
+        print(f"[{log_label}] Лист TikTok_Posts пуст или без заголовка.")
         return
 
-    print(f"[GPT_ONLY] Всего строк в TikTok_Posts: {len(rows)}")
-    print(f"[GPT_ONLY] Целевая колонка: {gpt_target_column}, колонка флага: {gpt_label_column}")
+    print(f"[{log_label}] Всего строк в TikTok_Posts: {len(rows)}")
+    print(f"[{log_label}] Целевая колонка: {gpt_target_column}, колонка флага: {gpt_label_column}")
 
     if overwrite:
         try:
@@ -1088,13 +1096,13 @@ def run_gpt_only(overwrite=False):
                 if len(r) <= label_idx:
                     rows[i] = r + [""] * (label_idx + 1 - len(r))
                 rows[i][label_idx] = ""
-            print("[GPT_ONLY] Все значения в колонке флага очищены, размечаем с нуля.")
+            print(f"[{log_label}] Все значения в колонке флага очищены, размечаем с нуля.")
         except ValueError:
-            print("[GPT_ONLY] Колонка флага не найдена, пропускаем очистку.")
+            print(f"[{log_label}] Колонка флага не найдена, пропускаем очистку.")
 
     rows, processed = apply_gpt_labels(
         service,
-        cluster_name="GPT_ONLY_YOUTUBE",
+        cluster_name=log_label,
         header=header,
         rows=rows,
         target_column=gpt_target_column,
@@ -1104,7 +1112,7 @@ def run_gpt_only(overwrite=False):
     )
 
     save_gpt_labels_only(service, header, rows, gpt_label_column)
-    print(f"[GPT_ONLY] Готово. GPT обработал строк: {processed}")
+    print(f"[{log_label}] Готово. GPT обработал строк: {processed}")
 
 
 # ---------- точка входа ----------
