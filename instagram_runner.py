@@ -21,6 +21,8 @@ def _int_from_config(key, default):
 
 BRIGHTDATA_API_KEY = CONFIG["BRIGHTDATA_API_KEY"]
 INSTAGRAM_DATASET_ID = CONFIG["INSTAGRAM_DATASET_ID"]
+# Для discover-эндпоинта (поиск/фид). Если не задано, используем основной dataset_id.
+INSTAGRAM_DISCOVER_DATASET_ID = CONFIG.get("INSTAGRAM_DISCOVER_DATASET_ID") or INSTAGRAM_DATASET_ID
 DEFAULT_NUM_OF_POSTS = _int_from_config("INSTAGRAM_DEFAULT_NUM_OF_POSTS", 3000)
 BASE_MAX_POSTS_PER_CLUSTER = _int_from_config("INSTAGRAM_MAX_POSTS_PER_CLUSTER", 3000)
 
@@ -202,8 +204,11 @@ def update_setting(service, key, new_value):
 
 def load_instagram_clusters(service):
     """
-    Читает лист Clusters и возвращает только активные строки с platform=Instagram.
+    Читает лист Clusters и возвращает только активные строки с platform=Instagram*.
     Формат строк: cluster_name | active | order | tiktok_search_url | platform
+    platform:
+        instagram (или пусто) — collect by URL (dataset_id=INSTAGRAM_DATASET_ID)
+        instagram_discover    — discover by URL (dataset_id=INSTAGRAM_DISCOVER_DATASET_ID)
     """
     sheet = service.spreadsheets()
     resp = sheet.values().get(
@@ -223,7 +228,7 @@ def load_instagram_clusters(service):
         if not name:
             continue
         platform = (row[4] if len(row) >= 5 else "").strip().lower()
-        if platform and platform != "instagram":
+        if platform and not platform.startswith("instagram"):
             continue
         active_flag = (row[1] or "").strip().upper() == "Y"
         try:
@@ -234,8 +239,15 @@ def load_instagram_clusters(service):
         if not url:
             continue
 
+        mode = "discover" if platform in ("instagram_discover", "instagram_reels_discover") else "collect"
+
         if name not in clusters:
-            clusters[name] = {"order": order, "active": active_flag, "urls": []}
+            clusters[name] = {
+                "order": order,
+                "active": active_flag,
+                "urls": [],
+                "mode": mode,
+            }
         clusters[name]["urls"].append(url)
         if active_flag:
             clusters[name]["active"] = True
@@ -346,6 +358,31 @@ def normalize_followers(val):
     except Exception:
         return val
 
+
+def extract_post_url(post):
+    """
+    Пытаемся вытащить URL поста из разных возможных полей Bright Data.
+    """
+    candidates = [
+        post.get("url"),
+        post.get("post_url"),
+        post.get("link"),
+        post.get("share_url"),
+        post.get("shortcode_url"),
+    ]
+
+    # если есть shortcode, строим инстаграмный URL
+    shortcode = post.get("shortcode")
+    if shortcode and isinstance(shortcode, str):
+        candidates.append(f"https://www.instagram.com/p/{shortcode}")
+
+    for c in candidates:
+        if not c:
+            continue
+        c_str = str(c).strip()
+        if c_str:
+            return c_str
+    return ""
 
 # ---------- GPT ----------
 
@@ -481,15 +518,16 @@ def apply_gpt_labels(
 
 # ---------- Bright Data ----------
 
-def start_scrape_for_urls(urls, limit_per_input=None, total_limit=None):
+def start_scrape_for_urls(urls, limit_per_input=None, total_limit=None, dataset_id=None):
     """
     Запускает асинхронный сбор в Bright Data по списку URLs.
     Возвращает snapshot_id.
     """
+    ds_id = dataset_id or INSTAGRAM_DATASET_ID
     base_url = "https://api.brightdata.com/datasets/v3/trigger"
 
     params = {
-        "dataset_id": INSTAGRAM_DATASET_ID,
+        "dataset_id": ds_id,
         "include_errors": "true",
         "format": "json",
     }
@@ -667,6 +705,13 @@ def format_column_e_numbers(service, last_row):
 
 def process_cluster(service, settings, cluster_name, cluster_data, with_gpt=True):
     urls = cluster_data["urls"]
+    mode = cluster_data.get("mode", "collect")
+
+    if mode == "discover":
+        dataset_id_to_use = INSTAGRAM_DISCOVER_DATASET_ID
+    else:
+        dataset_id_to_use = INSTAGRAM_DATASET_ID
+
     wait_bright_min = int(settings.get("wait_bright_min", "20"))
     gpt_target_column = settings.get("gpt_target_column", "profile_biography")
     gpt_label_column = settings.get("gpt_label_column", "gpt_flag")
@@ -702,13 +747,19 @@ def process_cluster(service, settings, cluster_name, cluster_data, with_gpt=True
         gpt_log_every = 10
 
     print("\n================ Новый кластер (Instagram) ================")
-    print("Кластер:", cluster_name, "URL-ов:", len(urls))
-    write_log(service, "start_cluster", cluster_name, f"urls={len(urls)} | platform=Instagram")
+    print("Кластер:", cluster_name, "URL-ов:", len(urls), "mode:", mode)
+    write_log(
+        service,
+        "start_cluster",
+        cluster_name,
+        f"urls={len(urls)} | platform=Instagram | mode={mode} | dataset_id={dataset_id_to_use}",
+    )
 
     result = start_scrape_for_urls(
         urls,
         limit_per_input=bright_limit_per_input,
         total_limit=bright_total_limit,
+        dataset_id=dataset_id_to_use,
     )
     snapshot_id = result["snapshot_id"]
     write_log(
@@ -813,12 +864,17 @@ def process_cluster(service, settings, cluster_name, cluster_data, with_gpt=True
         if url_val:
             existing_urls.add(url_val)
 
+    skipped_no_url = 0
+    skipped_duplicate = 0
+
     rows_to_append = []
     for p in posts:
-        url_val = (p.get("url", "") or "").strip()
+        url_val = extract_post_url(p)
         if not url_val:
+            skipped_no_url += 1
             continue
         if url_val in existing_urls:
+            skipped_duplicate += 1
             continue
         existing_urls.add(url_val)
 
@@ -869,9 +925,18 @@ def process_cluster(service, settings, cluster_name, cluster_data, with_gpt=True
         service,
         "rows_appended",
         cluster_name,
-        f"old={old_count} new_appended={len(rows_to_append)} total={len(rows)}",
+        (
+            f"old={old_count} new_appended={len(rows_to_append)} "
+            f"total={len(rows)} skipped_no_url={skipped_no_url} "
+            f"skipped_duplicate={skipped_duplicate}"
+        ),
     )
-    print(f"[{cluster_name}] rows_appended: old={old_count}, new={len(rows_to_append)}, total={len(rows)}")
+    print(
+        f"[{cluster_name}] rows_appended: old={old_count}, "
+        f"new={len(rows_to_append)}, total={len(rows)}, "
+        f"skipped_no_url={skipped_no_url}, "
+        f"skipped_duplicate={skipped_duplicate}"
+    )
 
     if with_gpt:
         rows, gpt_count = apply_gpt_labels(
