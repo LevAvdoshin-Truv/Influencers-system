@@ -102,7 +102,7 @@ https://docs.google.com/document/d/17AhEgIkJ-3MSd7Gb_J8ijSDB7lNVeDlpY1lwi5-QE2E/
 ## Секреты
 
 - `config.json` и `service-account.json` теперь в `.gitignore` и не хранятся в репозитории.
-- Заполни `config.example.json` и создай свой `config.json` + `service-account.json` в `/home/lev_avdoshin/tiktok-bot` (или локально) перед запуском.
+- Создай свой `config.json` + `service-account.json` в `/home/lev_avdoshin/tiktok-bot` (или локально) перед запуском.
 - Для GitHub Actions используй Secrets: `SSH_HOST`, `SSH_USER`, `SSH_PRIVATE_KEY`, `CONFIG_JSON` (полное содержимое файла), `SERVICE_ACCOUNT_JSON` (полное содержимое), опционально `SSH_PORT`, `SERVICE_ACCOUNT_PATH` (если файл на VM называется/лежит иначе; по умолчанию `service-account.json` в `$REMOTE_DIR`).
 
 ---
