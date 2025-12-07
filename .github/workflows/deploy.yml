@@ -1,0 +1,76 @@
+name: Deploy to VM
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_command:
+        description: "Optional command to run on the VM after deploy (e.g. python3 youtube_runner.py start)"
+        required: false
+        default: ""
+
+env:
+  REMOTE_DIR: /home/lev_avdoshin/tiktok-bot
+  REPO_URL: https://github.com/${{ github.repository }}.git
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepare SSH
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          echo "$SSH_PRIVATE_KEY" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H "$SSH_HOST" >> ~/.ssh/known_hosts
+
+      - name: Update repo on VM
+        env:
+          SSH_USER: ${{ secrets.SSH_USER }}
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          PORT=${SSH_PORT:-22}
+          ssh -p "$PORT" "$SSH_USER@$SSH_HOST" "mkdir -p '$REMOTE_DIR'"
+          ssh -p "$PORT" "$SSH_USER@$SSH_HOST" "if [ ! -d '$REMOTE_DIR/.git' ]; then git clone '$REPO_URL' '$REMOTE_DIR'; fi"
+          ssh -p "$PORT" "$SSH_USER@$SSH_HOST" "cd '$REMOTE_DIR' && git pull --ff-only"
+
+      - name: Push secrets to VM
+        env:
+          SSH_USER: ${{ secrets.SSH_USER }}
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          CONFIG_JSON: ${{ secrets.CONFIG_JSON }}
+          SERVICE_ACCOUNT_JSON: ${{ secrets.SERVICE_ACCOUNT_JSON }}
+          SERVICE_ACCOUNT_PATH: ${{ secrets.SERVICE_ACCOUNT_PATH }}
+        run: |
+          PORT=${SSH_PORT:-22}
+          SA_PATH="${SERVICE_ACCOUNT_PATH:-service-account.json}"
+
+          # Абсолютный путь оставляем как есть; относительный — кладём в $REMOTE_DIR
+          if [[ "$SA_PATH" = /* ]]; then
+            TARGET_SA="$SA_PATH"
+          else
+            TARGET_SA="$REMOTE_DIR/$SA_PATH"
+          fi
+
+          printf '%s' "$CONFIG_JSON" | ssh -p "$PORT" "$SSH_USER@$SSH_HOST" "cat > '$REMOTE_DIR'/config.json"
+          printf '%s' "$SERVICE_ACCOUNT_JSON" | ssh -p "$PORT" "$SSH_USER@$SSH_HOST" "cat > '$TARGET_SA'"
+          ssh -p "$PORT" "$SSH_USER@$SSH_HOST" "chmod 600 '$REMOTE_DIR'/config.json '$TARGET_SA'"
+
+      - name: Run optional command
+        if: github.event.inputs.run_command != ''
+        env:
+          SSH_USER: ${{ secrets.SSH_USER }}
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          RUN_COMMAND: ${{ github.event.inputs.run_command }}
+        run: |
+          PORT=${SSH_PORT:-22}
+          ssh -p "$PORT" "$SSH_USER@$SSH_HOST" "cd '$REMOTE_DIR' && $RUN_COMMAND"

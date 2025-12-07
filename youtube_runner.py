@@ -1129,5 +1129,8 @@ if __name__ == "__main__":
         run_gpt_only(overwrite=False)
     elif mode == "scrape_only":
         run_scrape_only()
+    elif mode == "start":
+        # алиас полного цикла для единообразия с TikTok-ботом
+        run_once()
     else:
         run_once()
