@@ -377,7 +377,7 @@ def extract_video_url(post):
 
 def call_gpt_label(prompt_base, text):
     if not OPENAI_API_KEY:
-        return ""
+        return "No API Access"
     if text is None:
         text = ""
     else:
@@ -413,6 +413,9 @@ def call_gpt_label(prompt_base, text):
         return ""
 
     if resp.status_code != 200:
+        if resp.status_code == 401:
+            print("GPT HTTP error 401: key rejected, marking as No API Access")
+            return "No API Access"
         print("GPT HTTP error:", resp.status_code, resp.text[:200])
         return ""
 
