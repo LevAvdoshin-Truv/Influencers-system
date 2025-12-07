@@ -145,3 +145,11 @@ YouTube (dataset discover/collect по платформе в Clusters):
 - Workflow `.github/workflows/deploy.yml` (manual) обновляет код на VM и заливает `config.json` + `service-account.json` из GitHub Secrets.
 - Если ключ сервисного аккаунта лежит в другом месте/под другим именем — задай секрет `SERVICE_ACCOUNT_PATH` (абсолютный путь или относительный к `$REMOTE_DIR`), чтобы workflow положил файл туда.
 - Запускается через Actions → Deploy to VM → Run workflow. Поле `run_command` (опционально): что выполнить после деплоя, например `source ~/venv/bin/activate && python3 youtube_runner.py start`.
+
+## GitHub Actions запуск команд
+
+- Workflow `.github/workflows/run_commands.yml` (manual) запускает бота на VM по готовым командам из README.
+- Ввод `target` при запуске:
+  - `tiktok_full`, `tiktok_gpt`, `tiktok_start`, `tiktok_scrape`
+  - `youtube_full`, `youtube_start`, `youtube_scrape`, `youtube_gpt`
+- Требуемые Secrets: `SSH_HOST`, `SSH_USER`, `SSH_PORT` (опц.), `SSH_PRIVATE_KEY`.
